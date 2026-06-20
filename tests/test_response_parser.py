@@ -13,7 +13,7 @@ Covers all 7 parse paths:
 import pytest
 from unittest.mock import patch, mock_open
 
-from agentic.response_parser import ResponseParser, ParserConfig
+from agentic.protocol.parser import ResponseParser, ParserConfig
 from agentic.exceptions import ParseError
 
 

@@ -24,7 +24,7 @@ import time
 from typing import List, Dict, Optional, Protocol
 
 from agentic.exceptions import ParseError, ToolNotFoundError, ToolExecutionError
-from agentic.logging_config import get_logger
+from agentic.observability import get_logger
 
 logger = get_logger(__name__)
 

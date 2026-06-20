@@ -19,9 +19,9 @@ if _PARENT not in sys.path:
     sys.path.insert(0, _PARENT)
 
 from agentic.config import get_config
-from agentic.logging_config import setup_logging, get_logger
+from agentic.observability import setup_logging, get_logger
 from agentic.exceptions import FatalError, ModelLoadError
-from agentic.response_parser import ResponseParser
+from agentic.protocol.parser import ResponseParser
 from agentic.protocol.template import PromptTemplate
 from agentic.protocol.format import OutputFormatter
 from agentic.tools import ToolRegistry, calculator_tool, weather_tool
@@ -59,7 +59,7 @@ def main():
     logger.init(f"Tools registered: {registry.list_names()}")
 
     # ── Step 3: Prompt Template + Parser + Sanitizer ────────────────
-    yaml_path = os.path.join(os.path.dirname(__file__), "llama", "ReActProtocol.yaml")
+    yaml_path = os.path.join(os.path.dirname(__file__), "agentic", "protocol", "ReActProtocol.yaml")
     template = PromptTemplate(yaml_path if os.path.exists(yaml_path) else None)
     parser = ResponseParser(yaml_path if os.path.exists(yaml_path) else None)
     sanitizer = ObservationSanitizer()

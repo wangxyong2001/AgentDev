@@ -24,7 +24,7 @@ from typing import Dict, List, Optional, Callable, Any
 from dataclasses import dataclass, field
 
 from agentic.exceptions import ToolNotFoundError, ToolExecutionError
-from agentic.logging_config import get_logger
+from agentic.observability import get_logger
 
 logger = get_logger(__name__)
 

@@ -22,7 +22,7 @@ from typing import List, Protocol, Dict, Any, Optional
 from dataclasses import dataclass
 
 from agentic.exceptions import ModelLoadError
-from agentic.logging_config import get_logger
+from agentic.observability import get_logger
 
 logger = get_logger(__name__)
 

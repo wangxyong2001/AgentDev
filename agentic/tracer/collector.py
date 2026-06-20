@@ -27,7 +27,7 @@ from agentic.tracer.diff import (
     decompose_prompt,
     compute_diff,
 )
-from agentic.logging_config import get_logger
+from agentic.observability import get_logger
 
 logger = get_logger(__name__)
 
@@ -255,7 +255,7 @@ class TraceCollector:
 
     def export_html(self, filepath: str):
         """Export self-contained HTML trace report."""
-        from ReActTraceRenderer import render_html
+        from agentic.tracer.renderer import render_html
         render_html(self.records, self.summary(), self.session_start, filepath)
 
 

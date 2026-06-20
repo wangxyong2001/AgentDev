@@ -9,7 +9,7 @@ Features:
   - Tag-aware LoggerAdapter for consistent formatting
 
 Usage:
-  >>> from agentic.logging_config import get_logger
+  >>> from agentic.observability import get_logger
   >>> logger = get_logger(__name__)
   >>> logger.agent("ReAct loop start")
   >>> logger.llm(prompt_tokens=188, completion_tokens=34, duration_ms=3914)
@@ -203,7 +203,7 @@ def get_logger(name: str) -> TagAdapter:
       TagAdapter with canonical tag methods.
 
     Usage:
-      >>> from agentic.logging_config import get_logger
+      >>> from agentic.observability import get_logger
       >>> logger = get_logger(__name__)
       >>> logger.agent("ReAct loop start")
       >>> logger.llm(prompt_tokens=188, completion_tokens=34, duration_ms=3914.0)

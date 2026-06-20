@@ -7,14 +7,14 @@ four-level regex parsing with subtle differences.
 
 Architecture:
   ResponseParser (unified engine)
-  ├── Config → ReActProtocol.yaml (preferred) or built-in defaults
+  ├── Config → agentic/protocol/ReActProtocol.yaml (preferred) or built-in defaults
   ├── preprocess()  — strip model-specific tags (Qwen <think>, etc.)
   ├── parse()       — four-level P1→P4 regex parsing with fallbacks
   └── validate()    — post-parse validation (action known, input safe)
 
 Usage:
-  >>> from agentic.response_parser import ResponseParser
-  >>> parser = ResponseParser(yaml_path="ReActProtocol.yaml")  # YAML-driven
+  >>> from agentic.protocol.parser import ResponseParser
+  >>> parser = ResponseParser(yaml_path="agentic/protocol/ReActProtocol.yaml")  # YAML-driven
   >>> parser = ResponseParser()                                 # Built-in defaults
   >>> result = parser.parse(llm_output, tool_names=["calculator", "get_weather"])
   >>> # result: {"thought": "...", "action": "calculator", "action_input": "123*45"}
@@ -86,7 +86,7 @@ class ResponseParser:
         Initialize parser from YAML file or explicit config.
 
         Args:
-          yaml_path: Path to ReActProtocol.yaml (optional)
+          yaml_path: Path to agentic/protocol/ReActProtocol.yaml (optional)
           config:    ParserConfig override (optional)
 
         If both are None, built-in defaults are used.

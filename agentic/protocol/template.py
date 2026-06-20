@@ -5,7 +5,7 @@ Handles Section 1 of the ReAct protocol: Agent → LLM prompt construction.
 
 Usage:
   >>> from agentic.protocol.template import PromptTemplate
-  >>> tpl = PromptTemplate(yaml_path="ReActProtocol.yaml")  # YAML-driven
+  >>> tpl = PromptTemplate(yaml_path="agentic/protocol/ReActProtocol.yaml")  # YAML-driven
   >>> tpl = PromptTemplate()                                 # Built-in defaults
   >>> prompt = tpl.render_full_prompt(tool_names, question, history)
 """
@@ -16,7 +16,7 @@ import os
 from typing import List, Dict, Optional, Any
 from dataclasses import dataclass, field, fields, MISSING
 
-from agentic.logging_config import get_logger
+from agentic.observability import get_logger
 
 logger = get_logger(__name__)
 

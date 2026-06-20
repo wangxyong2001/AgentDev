@@ -15,7 +15,7 @@ import logging
 import io
 import pytest
 
-from agentic.logging_config import (
+from agentic.observability import (
     HumanFormatter,
     JSONFormatter,
     TagAdapter,
