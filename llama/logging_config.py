@@ -92,7 +92,9 @@ class TagAdapter(logging.LoggerAdapter):
     def process(self, msg: str, kwargs: Dict[str, Any]) -> tuple:
         extra = kwargs.pop("extra", {})
         if self.extra:
-            extra.update(self.extra)
+            for key, value in self.extra.items():
+                if key not in extra:
+                    extra[key] = value
         kwargs["extra"] = extra
         return msg, kwargs
 
