@@ -548,7 +548,243 @@ def _apply_limits(memory_mb: int, allow_network: bool):
 
 ---
 
-## 8. 架构演进路线图
+## 8. 企业级 Agent 基础设施体系（专题调研）
+
+> ⚠️ **重要**: 本专题涵盖 RAG 知识库、缓存策略、权限鉴权、Prompt Injection 防御、多 Agent 协作隔离五⼤基础设施。含 Claude Code 源码逆向分析与 Anthropic 官⽅架构。
+
+### 8.1 RAG 知识库 — 关系型与向量数据库融合
+
+#### 8.1.1 Hybrid Search — 生产共识模式
+
+TiDB 1000 万行企业语料库基准测试：
+
+| 指标 | 纯向量 (top-5) | Hybrid (top-5) |
+|------|-------------|-------------|
+| Recall@5 | 72% | **94%** |
+| Precision@5 | 58% | **87%** |
+| 过期文档泄漏率 | 23% | **< 1%** |
+| 跨租户数据泄漏 | 8% | **0%** |
+
+三种核心 Hybrid SQL 模式：时效性过滤（向量+时间窗口）、租户隔离（向量+ACL JOIN）、分类排名（聚合+向量距离）。
+
+**数据来源**: [PingCAP: Hybrid Search for RAG](https://www.pingcap.com/blog/hybrid-search-rag-retrieval-accuracy/), [ScienceDirect: RAG Survey (2025)](https://www.sciencedirect.com/science/article/abs/pii/S1574013726000341)
+
+#### 8.1.2 PostgreSQL/pgvector 生产伸缩
+
+| 问题 | 方案 | 效果 |
+|------|------|------|
+| HNSW 内存上限 | `halfvec` (FP16) / `bit` (二值量化) | 存储减 50% 或 32× |
+| Post-filtering 破坏召回 | pgvector 0.8+ `strict_order` | 修复召回率损失 |
+| 10M+ 向量溢出 | pgvectorscale / StreamingDiskANN | SSD 级索引 |
+
+**数据来源**: [ClickHouse: Scale Vector Search in Postgres (2026)](https://clickhouse.com/resources/engineering/scale-vector-search-postgres)
+
+#### 8.1.3 数据库选型决策矩阵
+
+| 规模 | 推荐方案 |
+|------|---------|
+| < 100 万向量 | pgvector 默认配置（零运维成本） |
+| 100万-1000万 | pgvector + 量化 + Hybrid Search |
+| > 1000万 | 专用向量 DB (Milvus/Qdrant) 或 DiskANN |
+| 多租户 | 分区 + JOIN ACL 强制隔离 |
+| 统一数据库 | TiDB / SurrealDB 3.0 / seekdb (OceanBase) |
+
+> **反模式**: "Vector Sidecar" — 分离的关系型+向量数据库导致数据一致性窗口和权限变更重建索引。
+
+---
+
+### 8.2 缓存策略 — 语义缓存与多层体系
+
+#### 8.2.1 三层缓存架构
+
+```
+L1: Exact Match (< 1ms)
+    → Redis String, SHA-256 key → 相同查询瞬时命中
+
+L2: Semantic Cache (2-20ms)
+    → Redis Vector / LangCache → 语义相似查询命中
+    → 相似度阈值: 0.90-0.95 (高精度) / 0.85-0.90 (高召回)
+
+L3: Plan Cache (2026 新兴)
+    → 缓存整个 Agent 执行计划 → 相似任务复用推理骨架
+```
+
+#### 8.2.2 Agent Memory — 三层记忆模型
+
+| 类型 | 功能 | 实现 |
+|------|------|------|
+| 短期记忆 | 当前会话状态 | Redis checkpointer / SQLiteSession |
+| 长期记忆 | 跨会话用户偏好 | 向量嵌入 + 自动主题提取 |
+| 情景记忆 | Agent 从历史经验学习 | 成功/失败模式回放 |
+
+#### 8.2.3 缓存安全护栏
+
+| 场景 | 策略 |
+|------|------|
+| 时效敏感查询 | 强制 bypass |
+| 副作用工具 (send_email) | 禁止缓存 |
+| temperature > 0.5 | 禁止缓存 |
+| 租户隔离 | tenant_id 进 cache key |
+| PII | Presidio 脱敏后缓存 |
+
+#### 8.2.4 生产成本节省基准
+
+| 技术 | 节省 | 来源 |
+|------|------|------|
+| 语义缓存 | 30-50% | Redis 企业客户 |
+| 优化语义缓存 | **68.8%** | Redis Blog (Jan 2026) |
+| 模型路由 | 最高 85% | RouteLLM |
+| 组合使用 | **80%+** | 多来源共识 |
+
+**数据来源**: [Redis: RAG at Scale](https://redis.io/blog/rag-at-scale/), [GreenNode: Agentic RAG Architecture](https://greennode.ai/blog/rag-ai-agents-low-latency-architecture)
+
+---
+
+### 8.3 权限管理与鉴权 — Agent 身份基础设施
+
+#### 8.3.1 传统 IAM 为何失败
+
+| 传统假设 | Agent 现实 | 后果 |
+|---------|-----------|------|
+| 主体是人 | 非确定性实体 | OAuth 一主体一 Token 失效 |
+| 预置权限 | 行为不可预测 | RBAC 角色爆炸 |
+| 直接调用 | 链式委托 | 无法表达 Agent→Agent→Tool |
+| 静态策略 | 上下文每次不同 | 需运行时 PBAC 评估 |
+
+> **核心结论**: Agent 需要**新身份类别** — 不是人，不是服务账号。88% 企业使用/计划 Agent，仅 37% 通过 PoC（Descope 2026 调查）。
+
+#### 8.3.2 行业主流方案
+
+| 方案 | 核心能力 |
+|------|---------|
+| **Descope Agentic Identity Hub 2.0** | MCP 级授权、Agent Access Key、租户隔离 |
+| **Oasis AAM** | 自然语言→结构化意图→策略→权限 (Intent-aware) |
+| **Gravitee 4.10 AI IAM** | LLM Proxy + MCP Proxy + OpenFGA 关系授权 |
+| **Tetrate + Ory** | 运行时参数级策略、高风险步进认证 |
+
+#### 8.3.3 六层鉴权模型
+
+```
+Layer 1: Agent Identity (JIT 临时身份, 无长期特权)
+Layer 2: Intent Extraction (Prompt→结构化意图, 非 LLM 判断)
+Layer 3: Policy Evaluation (PBAC 运行时 + OpenFGA ReBAC)
+Layer 4: Tool-Level Enforcement (按工具/按参数/按请求)
+Layer 5: Approval Workflow (步进认证 + HITL)
+Layer 6: Audit Trail (人→Agent→Prompt→意图→策略→动作→结果)
+```
+
+**数据来源**: [Descope Agentic Identity Hub](https://www.globenewswire.com/news-release/2026/01/26/3225766/0/en/Descope-Unveils-Agentic-Identity-Hub-2-0-the-Most-Comprehensive-Identity-Platform-for-AI-Agents-and-MCP-Servers.html), [Runlayer: AI Agent Identity](https://www.runlayer.com/blog/ai-agent-identity-permissions-management)
+
+---
+
+### 8.4 Prompt Injection 防御 — 多层检测与 Agent 隔离
+
+#### 8.4.1 攻击面
+
+**已知 CVE**:
+| CVE | CVSS | 描述 |
+|-----|------|------|
+| CVE-2025-59536 | 8.7 | 项目代码在信任确认前执行 |
+| CVE-2026-21852 | — | 恶意项目覆盖 API 端点窃取密钥 |
+| CVE-2025-66032 | — | 缩写 git 参数绕过 Hook |
+
+**行业数据**: Snyk ToxicSkills (Feb 2026) — 3,984 个公开 Skill 扫描，**36%** 含 prompt injection。Microsoft 记录跨 **31 家公司、14 行业**的内存攻击。
+
+#### 8.4.2 开源防御方案
+
+**Airlock — 六层防御** (Apache 2.0, v0.3.0 June 2026):
+```
+Stage 1: Ingress   — Unicode 检测 + 混淆识别
+Stage 2: Action    — ML 分类器 (DeBERTa)
+Stage 3: Egress    — 数据外泄检测
+Stage 4: Persist   — Memory 写入前扫描
+Stage 5: Supply    — MCP 工具审查
+Stage 6: Response  — 工具输出消毒
+```
+36/36 注入技术被中和。AgentDojo 攻击成功率 **14.6% → 0%**。
+
+**apohara-agentguard** — Bash AST 解析（非子串匹配），Seccomp+Landlock 沙箱，零误报，SLSA L3 签名。
+
+**MCP Sanitization Proxy** — 协议级拦截 MCP 响应，三种模式: block/sanitize/warn。
+
+**数据来源**: [Airlock (GitHub)](https://github.com/Iskz17/airlock), [apohara-agentguard](https://github.com/SuarezPM/apohara-agentguard), [MCP Sanitization Proxy](https://github.com/dhiaa2/mcp-sanitization-proxy)
+
+---
+
+### 8.5 Agent 协作与隔离 — Claude Code 架构逆向
+
+> **源码基础**: `/home/nvidia/workspace/ClaudeCode/extracted-src` — TypeScript, ~800KB 主入口, Feature-Sliced Design 架构, 55 顶级模块
+
+#### 8.5.1 整体架构 (FSD 分层)
+
+```
+用户层: CLI / IDE (VSCode) / SDK (HTTP) / MCP
+应用层: main.tsx → bootstrap → REPL
+核心层: QueryEngine (消息/工具/成本) + query.ts (循环/压缩/流)
+  ├── Features:   commands/ tools/ skills/ plugins/ assistant/
+  ├── Entities:   Task.ts Tool.ts Agent.ts Session.ts
+  └── Shared:     services/ utils/ state/ types/ constants/
+```
+
+**核心统计**: 100+ 命令、40+ 工具、30+ 服务、146+ 组件、87+ Hooks、331 工具函数
+
+#### 8.5.2 Agent 分离机制
+
+| Agent 类型 | 隔离方式 | 工具权限 |
+|-----------|---------|---------|
+| **Main Agent** | 主进程 | 全权限（Permissions 策略控制） |
+| **Explore Agent** | 只读工具集 | 禁止写入/执行 |
+| **Plan Agent** | 仅推理 | 禁止 Edit/Write/Bash |
+| **Subagent (Worktree)** | 独立 Git Worktree | 限定 Worktree 目录 |
+| **Fork Agent** | 完全对话分支隔离 | 独立权限上下文 |
+
+**Worktree 隔离模式** (源码: `EnterWorktree` 工具):
+```
+主 Agent → EnterWorktree(name="feature-x")
+  ├── 创建 .claude/worktrees/feature-x/
+  ├── Git Worktree (独立分支)
+  ├── 工作目录切换到 Worktree
+  └── 退出: keep (保留) 或 remove (丢弃)
+```
+
+#### 8.5.3 工具权限体系
+
+源码 `utils/permissions/` — **24 个文件**:
+`PermissionMode.ts`, `permissionRuleParser.ts`, `dangerousPatterns.ts`, `bashClassifier.ts`, `yoloClassifier.ts`, `pathValidation.ts`, `shellRuleMatching.ts`, `denialTracking.ts`, `shadowedRuleDetection.ts`, `permissionsLoader.ts` 等。
+
+#### 8.5.4 Anthropic 官⽅三模式隔离架构
+
+| 模式 | 产品 | 隔离技术 | 安全边界 |
+|------|------|---------|---------|
+| **Ephemeral Container** | claude.ai | gVisor 容器, 每会话临时 FS | 容器逃逸防御 |
+| **HITL Sandbox** | Claude Code | Seatbelt/bubblewrap, deny network | 权限提示减少 84% |
+| **Sealed VM** | Claude Cowork | Apple Virtualization, 独立 kernel | 硬件级 VM 隔离 |
+
+**Anthropic 核⼼原则（官⽅确认）**:
+1. **凭证绝不进⼊沙箱** — credential-free sandbox
+2. **⼈在回路疲于审批** — 93% 提示被批准，审批疲劳是现实
+3. **⾃定义代理是最弱层** — 攻击者通过批准域名 API 外泄
+4. **⽤⼾本⾝是注⼊向量** — 钓⻥ 24/25 次成功
+5. **VM 隔离使 EDR 失明** — 企业合规双刃剑
+
+**数据来源**: [Anthropic: How We Contain Claude](https://www.anthropic.com/engineering/how-we-contain-claude), [Zero Trust for AI Agents](https://claude.com/blog/zero-trust-for-ai-agents), [Claude Code Source (extracted-src)](file:///home/nvidia/workspace/ClaudeCode/extracted-src/doc/SOURCE_ANALYSIS_REPORT.md)
+
+---
+
+### 8.6 本项⽬基础设施整合建议
+
+| 维度 | Phase 2 ⽬标 | Phase 3 ⽬标 |
+|------|-------------|-------------|
+| **RAG 知识库** | pgvector + Hybrid Search (RRF) | Agentic RAG + GraphRAG |
+| **缓存** | L1 Exact Match + Tool Result Memoization | L2 Semantic Cache (Redis/FAISS) |
+| **权限鉴权** | Agent Mode 枚举 + 工具级白名单 | PBAC 运行时策略引擎 + JIT 临时身份 |
+| **Prompt Injection 防御** | 确定性正则规则 (工具 I/O) | Airlock 集成 + MCP Proxy |
+| **Agent 隔离** | Explore/Plan/Code 模式枚举 | Worktree 隔离 + L1 seccomp Sandbox |
+| **记忆系统** | 会话内 history (已有) | 三层记忆 (短期/长期/情景) |
+
+---
+
+## 9. 架构演进路线图
 
 ```
 当前 (v2.1): 单体 ReActDemo + 5 个企业模块
@@ -576,7 +812,7 @@ Phase 3 (v3.0): ── 7 ⽉底 (⽣产就绪)
 
 ---
 
-## 9. 参考⽂献
+## 10. 参考⽂献
 
 | 序号 | 来源 | 类型 | URL |
 |------|------|------|-----|
@@ -604,13 +840,26 @@ Phase 3 (v3.0): ── 7 ⽉底 (⽣产就绪)
 | 21 | Claude Code Hooks — Multi-tier Defense | 官⽅⽂档 | https://docs.anthropic.com/en/docs/claude-code/hooks |
 | 22 | gVisor — Application Kernel for Containers | 开源项⽬ | https://gvisor.dev/docs/ |
 | 23 | Docker Security Bench — CIS Benchmark | ⾏业标准 | https://docker.com/security |
+| **RAG / 数据库 / 缓存 / 权限 / Prompt Injection 专⽤参考** | | | |
+| 24 | ScienceDirect — From Vectors to Knowledge Graphs (2025) | 学术调查 | https://www.sciencedirect.com/science/article/abs/pii/S1574013726000341 |
+| 25 | PingCAP — Hybrid Search for RAG (2025) | 行业基准 | https://www.pingcap.com/blog/hybrid-search-rag-retrieval-accuracy/ |
+| 26 | ClickHouse — Scale Vector Search in Postgres (2026) | 工程指南 | https://clickhouse.com/resources/engineering/scale-vector-search-postgres |
+| 27 | Redis — RAG at Scale (2026) | 官方文档 | https://redis.io/blog/rag-at-scale/ |
+| 28 | Descope Agentic Identity Hub 2.0 (Jan 2026) | 产品发布 | https://www.globenewswire.com/news-release/2026/01/26/3225766/0/en/Descope-Unveils-Agentic-Identity-Hub-2-0-the-Most-Comprehensive-Identity-Platform-for-AI-Agents-and-MCP-Servers.html |
+| 29 | Runlayer — AI Agent Identity & Permissions (May 2026) | 技术分析 | https://www.runlayer.com/blog/ai-agent-identity-permissions-management |
+| 30 | Anthropic — How We Contain Claude Across Products (2026) | 官方工程博客 | https://www.anthropic.com/engineering/how-we-contain-claude |
+| 31 | Anthropic — Zero Trust for AI Agents (May 2026) | 安全框架 | https://claude.com/blog/zero-trust-for-ai-agents |
+| 32 | Airlock — Layered Prompt Injection Defense (GitHub) | 开源项目 | https://github.com/Iskz17/airlock |
+| 33 | MCP Sanitization Proxy (GitHub) | 开源工具 | https://github.com/dhiaa2/mcp-sanitization-proxy |
+| 34 | Claude Code Source Analysis (extracted-src) | 源码逆向 | file:///home/nvidia/workspace/ClaudeCode/extracted-src/doc/SOURCE_ANALYSIS_REPORT.md |
 
 ---
 
-## 10. 版本历史
+## 11. 版本历史
 
 | 版本 | ⽇期 | 作者 | 变更说明 |
 |------|------|------|---------|
+| v1.2 | 2026-06-21 | AI Agent 架构组 | 新增第 8 章「企业级 Agent 基础设施体系」（RAG 知识库关系型/向量数据库融合、三层缓存策略、六层鉴权模型、Prompt Injection 多层防御体系、Claude Code FSD 架构逆向与 Agent 隔离模式）；参考⽂献扩展⾄ 34 项 |
 | v1.1 | 2026-06-21 | AI Agent 架构组 | 新增第 6 章「企业级 Agent 沙箱安全体系」（L0-L3 分级、OpenAI Harness-Sandbox 分离、WASM/Firecracker/gVisor 对⽐、⽣产检查清单）；更新差距分析（新增⼯具沙箱安全 + Guardrails 维度）；更新架构路线图（增加 sandbox.py + L2 容器化）；扩展参考⽂献⾄ 23 项 |
 | v1.0 | 2026-06-21 | AI Agent 架构组 | 初版：三⼤⽣态调研、范式对⽐、差距分析、推荐路线图 |
 
