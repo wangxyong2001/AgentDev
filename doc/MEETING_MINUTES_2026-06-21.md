@@ -1,8 +1,9 @@
 # ReAct Agent 项目 — 架构评审与改进讨论会议纪要
 
-> 会议日期: 2026-06-21 | 会议类型: 多角色联合架构评审
+> 会议日期: 2026-06-21 | 会议类型: 多角色联合架构评审 (两轮)
 > 参会人员: 产品经理、架构师、开发工程师、测试工程师、信息安全工程师、AI Agent 架构组
-> 基础材料: [INDUSTRY_RESEARCH.md (v1.4, 1401行, 13章)](INDUSTRY_RESEARCH.md)
+> 基础材料: [INDUSTRY_RESEARCH.md v1.5 (1658行, 14章)](INDUSTRY_RESEARCH.md)
+> 共识总数: 9 项 (第一轮 5 项 + 第二轮 4 项)
 
 ---
 
@@ -276,5 +277,101 @@ Agent 进程 (Trusted Runtime)
 
 ---
 
-> **下次会议**: Phase 2 收尾后 (约 1 个月) — 评审 Phase 2 交付物与新评分
+## 6. 第二轮会议 — Agent 评估·监测·审计 (基于 §11 新发现)
+
+> **会议时间**: 2026-06-21 (同日续会)
+> **基础材料**: [INDUSTRY_RESEARCH.md §11](INDUSTRY_RESEARCH.md) — Agent 评估·监测·审计方法论
+> **参会**: 产品经理、架构师、开发工程师、测试工程师、信息安全工程师
+
+### 6.1 本轮新增共识
+
+#### 共识 6: Eval 基础设施从 Phase 3 前移至 Phase 2 尾部 (5/5 同意)
+
+**理由**: 六维度轨迹评分应在 Phase 2 交付物评审时就有基线数据。复合误差 `0.95⁸≈66%` 意味着每项改进的真实效果必须用量化指标衡量，否则"改进了什么"不可知。
+
+**实现**: 新增 `llama/eval/scorer.py` (EvalScorer 纯函数) + `tests/eval/test_ci_gates.py` (pytest 断言) + `ci_assert.py` (CLI 脚本)。**2 个文件，零新依赖**。
+
+#### 共识 7: SQLite Ledger 采用防篡改哈希链 Schema (5/5 同意)
+
+**理由**: §11.3.3 的 SHA-256 哈希链 Schema 是 SOC2 CC7.2 的最低合规要求，且与第一轮已共识的 SQLite Ledger 天然对齐。只需在现有设计上增加 `prev_span_hash` 和 `compliance_tags` 两列——**零额外成本**。
+
+**边缘设备适配**: 无 TPM/HSM 无法阻止物理篡改，但哈希链可**检测**篡改。每日完整性校验脚本重建链比对 + 导出 Merkle Root 做外部锚定。SQLite append-only 天然满足不可变要求。
+
+#### 共识 8: 自诊断 Agent 工具 (4/5 同意, 测试工程师建议 Phase 3)
+
+**理由**: 报告 §11.2.6 的自诊断 Agent 模式（显式+隐式信号）可将 Agent 内部状态暴露为结构化诊断文本。实现极简：给 ToolRegistry 注册 `self_diagnose` 工具（约 40 行），从 TraceCollector 读取当前会话 summary，对比预设阈值返回诊断。
+
+**分歧**: 测试工程师建议在 Eval 基准建立后再加入自诊断（避免自我报告偏差），Phase 3 实施。其余 4 人认为成本极低可立即实施。
+
+#### 共识 9: 六维度分层评分 — 确定性规则优先, LLM Judge 仅用于语义维度 (5/5 同意)
+
+**理由**: 本地仅有一个 Qwen3.6-35B 模型，无法用"不同模型家族"做 Judge（报告 §11.1.7 警告 Judge-Worker 串通）。
+
+| 确定性规则评分 | LLM Judge 评分 |
+|-------------|---------------|
+| Tool Selection (工具名精确匹配) | Argument Extraction 语义 |
+| Argument 语法 (Schema 正则校验) | Result Utilization |
+| Plan Coherence (循环/深度计数) | Task Completion |
+| Error Recovery (重试次数/类型) | — |
+
+**策略**: 确定性维度在前置快速门限拦截（秒级），LLM Judge 仅覆盖语义维度（需要上下文理解），且用对抗提示（强制挑错）+ 多次打分取分位数缓解串通。
+
+### 6.2 行动项补充
+
+#### 立即执行 (加入 Phase 2)
+
+| 任务 | 工时 | 产出 |
+|------|------|------|
+| `llama/eval/scorer.py` — EvalScorer 六维度纯函数 | 4h | CI 闸门数据源 |
+| `tests/eval/conftest.py` + `test_ci_gates.py` — CI 闸门测试 | 4h | 六维度自动断言 |
+| `tests/eval/datasets/` — 50 例私有 Eval 数据集 (4 类) | 6h | 正常20/边界15/注入10/错误恢复5 |
+| SQLite Ledger 升级 — 增加哈希链 + compliance_tags 列 | 2h | SOC2 CC7.2 合规 |
+
+#### Eval 数据集四类构成
+
+| 类别 | 数量 | 示例 |
+|------|------|------|
+| 正常 | 20 | 简单计算、天气查询、多步推理 |
+| 边界 | 15 | 空输入、除零、未知城市、工具返回失败 |
+| 注入 | 10 | 角色扮演越狱、eval 逃逸字符串、Observation 反向注入、Unicode 混淆 |
+| 错误恢复 | 5 | 工具超时、解析失败恢复 |
+
+### 6.3 本轮新增的技术决策
+
+| 决策 | 内容 | 投票 |
+|------|------|------|
+| LlamaTracer = Eval Engine | 现有 TraceCollector 数据管道已完备，新加 EvalScorer 纯函数层即可 | 5/5 |
+| audit_access_log 独立表 | 审计日志的访问记录写入独立 SQLite 表，不同文件权限 (OS RBAC) | 5/5 |
+| pass^k ≥ 5 rollout | ReAct 8 步 Agent 非确定性，单次运行置信度不足 | 5/5 |
+| AgentAuditKit CI 集成 | Phase 3 以 `--format junit` 接入 CI 流水线 | 5/5 |
+| self_diagnose 工具 | Phase 2 或 Phase 3？ | 4/5 (延至 Phase 3) |
+
+### 6.4 第一轮共识调整
+
+| 原共识 | 调整 | 原因 |
+|--------|------|------|
+| #5 SQLite Ledger | **升级**: 采用 §11.3.3 哈希链 Schema (防篡改) | SOC2 CC7.2 最低要求 |
+| #1 L1 沙箱 | **补充**: 沙箱内不持有凭证 (即使工具被投毒也无法横向移动) | Anthropic 原则 #1 |
+| #3 Observation 消毒 | **补充**: 消毒后增加合规标签 (`compliance_tags`) | 审计追溯 |
+| 行动计划 Phase 2 | **新增**: Eval 基础设施 (EvalScorer + CI 闸门 + 50 例 Dataset) | 复合误差量化需求 |
+| 行动计划 Phase 2 | **新增**: SQLite Ledger 升级为哈希链 Schema | 合规基线 |
+
+### 6.5 更新后的目标终态
+
+| 维度 | 当前 | Phase 2 后 (调整后) | Phase 3 后 |
+|------|------|-------------------|-----------|
+| 架构模块化 | 5/10 | 6/10 | 7/10 |
+| 工具沙箱安全 | 1/10 | 5/10 (L1) | 7/10 (L2) |
+| 错误韧性 | 4/10 | 6/10 | 8/10 |
+| Guardrails | 0/10 | 3/10 | 6/10 |
+| 可观测性 | 6/10 | 6/10 | 8/10 |
+| 测试覆盖 | 3/10 | 5/10 (+Eval 体系) | 7/10 |
+| 状态持久化 | 0/10 | 4/10 (SQLite+Ledger+哈希链) | 6/10 |
+| **评估体系** 🆕 | **0/10** | **3/10** (EvalScorer+50例+CI闸门) | **6/10** |
+| **审计合规** 🆕 | **0/10** | **3/10** (哈希链+audit_access_log) | **5/10** |
+| **综合** | **2.7/10** | **4.9/10** | **7.0/10** |
+
+---
+
+> **下次会议**: Phase 2 收尾后 (约 1 个月) — 评审 Phase 2 交付物与新评分，重点审查 Eval 基线数据
 > **会议纪要维护**: 本纪要随项目演进持续更新，重大决策追溯至本会议记录
