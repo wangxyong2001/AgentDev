@@ -1,0 +1,172 @@
+# ==========================================================================
+# ReAct Agent Protocol Template v1.0
+#
+# 定义 Agent ↔ LLM ↔ User 三方交互的数据格式契约:
+#   Section 1: prompt    — Agent 发给 LLM 的完整 prompt 结构
+#   Section 2: response  — LLM 回复的解析规则
+#   Section 3: output    — Agent 返回给用户的格式化输出
+#
+# 切换模型/调整格式只需修改此文件，无需改动代码。
+# ==========================================================================
+
+protocol:
+  name: "ReAct-v1"
+  description: "Standard ReAct loop with Thought/Action/Action Input/Observation"
+  version: "1.0.0"
+
+# ==========================================================================
+# Section 1: Agent → LLM  (Prompt 构建)
+# ==========================================================================
+prompt:
+  # --- 聊天模板 ---
+  # 使用 Qwen chat_template 的 special tokens 手动组装
+  # 可选值: "qwen2" | "llama3" | "chatml" | "raw"
+  chat_template: "qwen2"
+
+  # 各角色的分隔标记
+  delimiters:
+    system_start: "<|im_start|>system\n"
+    system_end:   "<|im_end|>"
+    user_start:   "<|im_start|>user\n"
+    user_end:     "<|im_end|>"
+    assistant_start: "<|im_start|>assistant\n"
+    assistant_end:   ""   # assistant 段不闭合，让模型续写
+
+  # --- 各段定义 ---
+  sections:
+
+    # S1: System Prompt (固定前缀，每轮不变 — 最适合 KV-cache 复用)
+    system:
+      # 角色描述
+      role: |
+        You are a ReAct agent. You MUST follow the EXACT format below.
+        Do NOT add extra explanations, do NOT use <think> tags, just follow the format:
+      # 格式规则
+      format_rules:
+        - 'After "Thought:" write your reasoning in ONE line'
+        - 'After "Action:" write ONLY the tool name: {tool_names}'
+        - 'After "Action Input:" write the tool input'
+        - 'After you have the answer, use "Final Answer:"'
+      # 工具列表渲染
+      tools_header: "Available tools:"
+      tool_item_format: "- {name}: {description}"
+
+    # S2: User Message (每轮可变)
+    user:
+      template: "{question}"
+
+    # S3: Assistant History (累积增长)
+    history:
+      # 每轮新增的历史条目格式
+      entry_format: |
+        Thought: {thought}
+        Action: {action}
+        Action Input: {action_input}
+        Observation: {observation}
+
+    # 本轮触发 (prompt 末尾，引导模型开始输出)
+    trigger: "Thought:"
+
+# ==========================================================================
+# Section 2: LLM → Agent  (Response 解析)
+# ==========================================================================
+response:
+  # --- LLM 调用参数 ---
+  generation:
+    max_tokens: 512
+    temperature: 0.2
+
+  # --- 停止序列 ---
+  stop_sequences:
+    - "Observation:"
+    - "<|im_end|>"
+
+  # --- 输出预处理 ---
+  preprocessing:
+    # Qwen 思考模型标签清理
+    strip_tags:
+      - "<think>.*?</think>"
+      - "<response>"
+      - "</response>"
+      - "<\\s*/\\s*think\\s*>"
+
+  # --- 解析规则 (按优先级) ---
+  parsing:
+
+    # P1: 检测 Final Answer
+    final_answer:
+      pattern: "Final Answer:\\s*(.*)"
+      flags: [DOTALL]
+      on_match: "return_final"
+
+    # P2: 提取 Thought
+    thought:
+      pattern: "Thought:\\s*(.+?)(?=\\n(?:Action|Final)|$)"
+      flags: [DOTALL]
+      required: false   # Thought 是可选的
+      fallback: "first_line"  # 取第一行作为 thought
+
+    # P3: 提取 Action
+    action:
+      pattern: "Action:\\s*(\\S+)"
+      required: true
+      # 如果正则失败，尝试回退匹配
+      fallback: "tool_name_in_text"
+
+    # P4: 提取 Action Input
+    action_input:
+      pattern: "Action Input:\\s*(.+?)(?=\\n(?:Thought|Action|Final|Observation)|$)"
+      flags: [DOTALL]
+      required: false
+      fallback: "text_after_action"
+
+# ==========================================================================
+# Section 3: Agent → User  (输出格式化)
+# ==========================================================================
+output:
+
+  # --- 终端日志格式 ---
+  terminal:
+    agent_start:    "[AGENT] === ReAct loop start ==="
+    agent_question: "[AGENT] Question: {question}"
+    step_header:    "[STEP {step}] --------------------------------------------------"
+    llm_raw:        "[LLM] Raw: {raw_output}"
+    llm_tokens:     "[LLM] tokens: prompt={prompt_tokens}  completion={completion_tokens}  duration={duration_ms}ms"
+    diff_line:      "[DIFF] {summary}"
+    diff_initial:   "[DIFF] initial prompt | system={system_len}ch user={user_len}ch history={history_len}ch"
+    trace_thought:  "[TRACE] Thought: {thought}"
+    trace_action:   "[TRACE] Action: {action}"
+    trace_input:    "[TRACE] Input: {action_input}"
+    trace_obs:      "[TRACE] Observation: {observation}"
+    result_final:   "[RESULT] Final Answer: {answer}"
+    result_line:    "[RESULT] {result}"
+    warn_max_steps: "[WARN] Max steps ({max_steps}) reached. Loop terminated."
+    error_parse:    "[ERROR] Parse failed: {error}"
+
+  # --- 工具执行 ---
+  tool_error_unknown: "Unknown action: '{action}'. Available actions: {tool_list}"
+  tool_error_exec:    "Tool execution error: {error}"
+
+  # --- Trace 报告 ---
+  trace_header: |
+    ╔═══════════════════════════════════════════════════════════════════════════════╗
+    ║              ReAct Trace Report                                               ║
+    ╠═══════════════════════════════════════════════════════════════════════════════╣
+    ║  Model: {model:<46s}                                                          ║
+    ║  Turns: {turns:<5}  Duration: {duration:.1f}s{'':>30s}                        ║
+    ╠═══════════════════════════════════════════════════════════════════════════════╣
+    ║  Token Usage                                                                  ║
+    ║    Prompt tokens:      {prompt_tokens:>8,d}                                   ║
+    ║    Completion tokens:  {completion_tokens:>8,d}                               ║
+    ║    Total:              {total_tokens:>8,d}                                    ║
+    ╠═══════════════════════════════════════════════════════════════════════════════╣
+    ║  Cache Analysis (estimated)                                                   ║
+    ║    Cached tokens:      {cached_tokens:>8,d} [{cache_bar}]                     ║
+    ║    New tokens:         {new_tokens:>8,d}                                      ║
+    ║    Cache hit rate:     {cache_rate:>6.1f}%                                    ║
+    ║    Avg prompt reuse:   {avg_reuse:>6.1f}%  [{reuse_bar}]                      ║
+    ║    System changes:     {system_changes} (should be 0)                         ║
+    ╠═══════════════════════════════════════════════════════════════════════════════╣
+    ║  Cost: ¥{cost:.6f}  |  Tools: {tools}  |                                      ║
+    ║  Errors: {errors}   |  LLM: {llm_time:.0f}ms                                  ║
+    ╚═══════════════════════════════════════════════════════════════════════════════╝

@@ -1,0 +1,1553 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import re
+import sys
+import json
+import time
+from typing import List, Dict, Any, Optional
+from dataclasses import dataclass, field
+from datetime import datetime
+
+# 尝试导入 llama-cpp-python
+try:
+    from llama_cpp import Llama
+except ImportError:
+    print("[FATAL] llama-cpp-python not installed. Run: pip install llama-cpp-python")
+    sys.exit(1)
+
+# 尝试导入 langchain tools
+try:
+    from langchain.tools import tool
+except ImportError:
+    print("[FATAL] langchain not installed. Run: pip install langchain")
+    sys.exit(1)
+
+# ── 时间戳打印工具 ──
+import builtins
+
+
+def ts_print(*args, **kwargs):
+    """带毫秒时间戳的 print 包装函数。格式: [HH:MM:SS.mmm] 原内容"""
+    from datetime import datetime
+    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    builtins.print(f"[{ts}]", *args, **kwargs)
+
+
+# 尝试导入 yaml
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
+# ==========================================
+# 0. 协议加载器 — 从 YAML 模板加载交互格式
+# ==========================================
+
+class ProtocolLoader:
+    """
+    从 YAML 模板文件加载 ReAct 交互协议。
+
+    设计目的:
+      将 Agent↔LLM↔User 三方交互的数据格式从硬编码中解耦。
+      切换模型、调整输出格式只需修改 YAML 文件，无需改动任何 Python 代码。
+
+    YAML 协议定义三个 Section:
+      Section 1 (prompt):   Agent 发给 LLM 的完整 prompt 结构
+        - system 段: 角色描述 + 格式规则 + 工具定义 (固定前缀, 每轮不变)
+        - user 段:   用户问题 (每轮可变)
+        - history 段: 累积的 Thought/Action/Observation 历史 (逐步增长)
+        - trigger:   引导模型开始输出的触发词 (如 "Thought:")
+      Section 2 (response): LLM 回复的解析规则
+        - stop_sequences:  停止生成的 token 列表
+        - preprocessing:   输出预处理 (如清除 Qwen 的 <think> 标签)
+        - parsing:         正则表达式 + 回退策略 (按优先级 P1~P4 解析)
+      Section 3 (output):  Agent 返回给用户的格式化输出模板
+
+    用法示例:
+      >>> protocol = ProtocolLoader("ReActProtocol.yaml")
+      >>> prompt = protocol.render_full_prompt(tools, question, history)
+      >>> parsed = protocol.parse_response(llm_output, tools)
+      >>> log_line = protocol.fmt("agent_start")
+    """
+
+    def __init__(self, yaml_path: str):
+        """
+        加载并解析 YAML 协议文件。
+
+        参数:
+          yaml_path: YAML 协议文件的绝对路径或相对路径
+
+        初始化流程:
+          1. 检查 pyyaml 是否可用, 不可用则抛出 ImportError
+          2. 使用 yaml.safe_load() 加载文件内容到 self.cfg
+          3. 分离三个子配置: prompt_cfg / response_cfg / output_cfg
+          4. 预编译所有解析正则表达式 (提升运行时性能)
+
+        异常:
+          ImportError: pyyaml 未安装
+          FileNotFoundError: YAML 文件不存在
+          yaml.YAMLError: YAML 格式错误
+          KeyError: YAML 缺少必需的 Section
+        """
+        if yaml is None:
+            raise ImportError("pyyaml required. Run: pip install pyyaml")
+        with open(yaml_path, 'r', encoding='utf-8') as f:
+            self.cfg = yaml.safe_load(f)
+
+        self.prompt_cfg = self.cfg["prompt"]
+        self.response_cfg = self.cfg["response"]
+        self.output_cfg = self.cfg["output"]
+        self._compile_patterns()
+
+    # -----------------------------------------------------------------
+    # 模板渲染 — 将结构化数据按协议填充到模板中
+    # -----------------------------------------------------------------
+
+    def render_system_prompt(self, tools) -> str:
+        """
+        渲染 System Prompt 段 — prompt 中唯一固定不变的部分。
+
+        组成:
+          1. 角色描述 (YAML: sections.system.role)
+          2. 格式规则 (YAML: sections.system.format_rules) — 可引用 {tool_names}
+          3. 工具列表 (YAML: sections.system.tool_item_format) — 逐个格式化
+
+        参数:
+          tools: langchain @tool 装饰的工具函数列表 (需有 .name 和 .description 属性)
+
+        返回:
+          完整的 system prompt 文本, 不含 chat_template 包裹标签 (由 render_full_prompt 统一包裹)
+
+        设计意图:
+          此段内容在整个会话中完全不变, 是 KV-cache 的最佳复用对象。
+        """
+        s = self.prompt_cfg["sections"]["system"]
+        tool_names = ', '.join([t.name for t in tools])
+        tool_items = "\n".join([
+            s["tool_item_format"].format(name=t.name, description=t.description)
+            for t in tools
+        ])
+
+        rules = "\n".join([
+            r.format(tool_names=tool_names) for r in s["format_rules"]
+        ])
+
+        return f"""{s['role']}
+{rules}
+
+{s['tools_header']}
+{tool_items}"""
+
+    def render_user_message(self, question: str) -> str:
+        """
+        渲染 User Message 段 — 每轮可变的问题或 Observation 反馈。
+
+        参数:
+          question: 用户原始问题 或 上轮 Observation 注入的新指令
+
+        返回:
+          填充后的 user message 文本
+        """
+        tpl = self.prompt_cfg["sections"]["user"]["template"]
+        return tpl.format(question=question)
+
+    def render_history_entry(self, thought: str, action: str,
+                              action_input: str, observation: str) -> str:
+        """
+        渲染单条 ReAct 历史记录 — Thought/Action/ActionInput/Observation 四元组。
+
+        参数:
+          thought:      模型输出的推理过程
+          action:       模型选择的工具名 (或 "final_answer" / "none")
+          action_input: 传给工具的参数
+          observation:  工具执行结果 (或 parse error 信息)
+
+        返回:
+          按协议模板格式化后的历史条目字符串
+
+        说明:
+          每轮 ReAct 完成后调用此方法, 生成一条新的历史条目,
+          附加到 prompt 的 assistant 段中, 供下一轮 LLM 调用时参考。
+        """
+        tpl = self.prompt_cfg["sections"]["history"]["entry_format"]
+        return tpl.format(thought=thought, action=action,
+                          action_input=action_input, observation=observation)
+
+    def render_full_prompt(self, tools, question: str, history: str) -> str:
+        """
+        渲染发送给 LLM 的完整 ReAct Prompt。
+
+        组装顺序:
+          <|im_start|>system     ← render_system_prompt(tools)
+          {system_content}
+          <|im_end|>
+          <|im_start|>user       ← render_user_message(question)
+          {user_content}
+          <|im_end|>
+          <|im_start|>assistant  ← 历史记录 + 本轮触发
+          {history_text}           (上一轮及之前的所有 Thought/Action/Observation)
+          Thought:                 (引导模型开始输出)
+
+        参数:
+          tools:    工具列表
+          question: 用户问题或 Observation 反馈
+          history:  已累积的历史记录字符串 (多行)
+
+        返回:
+          完整的 prompt 字符串, 可直接送入 llama_cpp.Llama().__call__()
+        """
+        d = self.prompt_cfg["delimiters"]
+        system = self.render_system_prompt(tools)
+        user_msg = self.render_user_message(question)
+        trigger = self.prompt_cfg["sections"]["trigger"]
+
+        return (
+            f"{d['system_start']}{system}{d['system_end']}\n"
+            f"{d['user_start']}{user_msg}{d['user_end']}\n"
+            f"{d['assistant_start']}{history}\n"
+            f"{trigger}"
+        )
+
+    # -----------------------------------------------------------------
+    # 响应解析 — 从 LLM 的原始文本输出中提取结构化数据
+    # -----------------------------------------------------------------
+
+    def _compile_patterns(self):
+        """
+        预编译所有解析用正则表达式。
+
+        为什么预编译:
+          ReAct 循环中每轮都要解析 LLM 输出, 预编译可以避免重复编译开销。
+          4 个正则分别对应: Final Answer / Thought / Action / Action Input
+
+        正则标志映射:
+          YAML 中用字符串表示 flag (如 "DOTALL"), 此处映射为 re 模块常量。
+          支持的 flag: DOTALL (跨行匹配), MULTILINE, IGNORECASE
+        """
+        pp = self.response_cfg["parsing"]
+        flags_map = {"DOTALL": re.DOTALL, "MULTILINE": re.MULTILINE, "IGNORECASE": re.IGNORECASE}
+
+        def _flags(flist):
+            f = 0
+            for name in (flist or []):
+                f |= flags_map.get(name, 0)
+            return f
+
+        self._re_final = re.compile(pp["final_answer"]["pattern"], _flags(pp["final_answer"].get("flags")))
+        self._re_thought = re.compile(pp["thought"]["pattern"], _flags(pp["thought"].get("flags")))
+        self._re_action = re.compile(pp["action"]["pattern"])
+        self._re_action_input = re.compile(pp["action_input"]["pattern"], _flags(pp["action_input"].get("flags")))
+
+    def preprocess_output(self, raw: str) -> str:
+        """
+        LLM 原始输出预处理 — 清除模型特定的包装标签。
+
+        处理内容:
+          - Qwen 思考模型的 <think>...</think> 标签 (内部推理, 对 Agent 无用)
+          - <response> / </response> 包装标签
+          - 其他在 YAML preprocessing.strip_tags 中配置的标签
+
+        参数:
+          raw: LLM 返回的原始文本 (可能包含模型特有的 XML 标签)
+
+        返回:
+          去除包装标签后的纯文本
+
+        注意:
+          预处理后的文本可能为空字符串, 此时由 parse_response 回退处理。
+        """
+        pp = self.response_cfg["preprocessing"]
+        cleaned = raw
+        for tag in pp.get("strip_tags", []):
+            cleaned = re.sub(tag, '', cleaned, flags=re.DOTALL)
+        return cleaned.strip()
+
+    def parse_response(self, output: str, tools) -> Dict[str, str]:
+        """
+        按协议定义的优先级解析 LLM 输出 — P1~P4 四级回退。
+
+        解析优先级:
+          P1: 检测 "Final Answer:" → 直接返回最终答案, 终止 ReAct 循环
+          P2: 提取 "Thought:"  → 模型推理过程 (可选, 某些模型会跳过)
+          P3: 提取 "Action:"   → 模型选择的工具名 (必须, 否则触发回退策略)
+          P4: 提取 "Action Input:" → 传给工具的参数
+
+        回退策略:
+          - Action 正则匹配失败时 → 在文本中扫描已注册的工具名
+          - Action Input 匹配失败时 → 取 Action 行之后的第一行文本
+          - Thought 匹配失败时   → 取输出的第一行作为 thought
+          - 所有回退都失败        → 抛出 ValueError (由调用方触发 Error Recovery)
+
+        参数:
+          output: 经过 preprocess_output 清洗后的 LLM 输出文本
+          tools:  已注册的工具列表 (用于回退时的工具名匹配)
+
+        返回:
+          {"thought": str, "action": str, "action_input": str}
+          - action 为 "final_answer" 时, action_input 即为最终答案
+          - action 为 "none" 时, 表示解析完全失败
+
+        异常:
+          ValueError: 所有解析策略均失败 (模型输出完全不遵循协议)
+        """
+        clean = self.preprocess_output(output)
+        if not clean:
+            clean = output.strip()
+
+        # P1: Final Answer — 最高优先级, 直接返回
+        fa = self._re_final.search(clean)
+        if fa:
+            return {
+                "thought": "I now know the final answer",
+                "action": "final_answer",
+                "action_input": fa.group(1).strip()
+            }
+
+        # P2: Thought — 可选字段, 提取失败时用第一行回退
+        thought = ""
+        tm = self._re_thought.search(clean)
+        if tm:
+            thought = tm.group(1).strip()
+        elif self.response_cfg["parsing"]["thought"].get("fallback") == "first_line":
+            thought = clean.split('\n')[0].strip()
+
+        # P3: Action — 必须字段, 失败时触发工具名回退匹配
+        am = self._re_action.search(clean)
+        if not am:
+            # fallback: 在输出文本中逐一扫描已注册工具的名称
+            for t in tools:
+                if t.name in clean:
+                    m = re.search(rf"{t.name}\s*(.*)", clean)
+                    return {
+                        "thought": thought or clean.split('\n')[0].strip(),
+                        "action": t.name,
+                        "action_input": m.group(1).strip().strip('()"\'') if m else clean.strip()
+                    }
+            # 所有策略均失败 — 模型输出完全不可解析
+            raise ValueError(f"No 'Action:' found in LLM output. Got: {clean[:200]}")
+        action = am.group(1).strip()
+
+        # P4: Action Input — 可选字段, 失败时取 Action 后面的文本
+        aim = self._re_action_input.search(clean)
+        if aim:
+            action_input = aim.group(1).strip()
+        else:
+            rest = clean[am.end():].strip()
+            action_input = rest.split('\n')[0].strip() if rest else ""
+
+        if not thought:
+            thought = clean.split('\n')[0].strip() or "(reasoning)"
+
+        return {
+            "thought": thought,
+            "action": action,
+            "action_input": action_input
+        }
+
+    # -----------------------------------------------------------------
+    # 输出格式化 — 从模板渲染终端日志 & 对外输出
+    # -----------------------------------------------------------------
+
+    def fmt(self, key: str, **kwargs) -> str:
+        """
+        从 YAML output.terminal 段按 key 取模板, 用 kwargs 填充后返回。
+
+        用法:
+          protocol.fmt("agent_start")          → "[AGENT] === ReAct loop start ==="
+          protocol.fmt("step_header", step=3)  → "[STEP 3] --------------------------------------------------"
+          protocol.fmt("llm_tokens", prompt_tokens=100, completion_tokens=20, duration_ms="500")
+
+        参数:
+          key:    YAML output.terminal 下的模板键名
+          kwargs: 模板中的 {placeholder} 替换值
+
+        返回:
+          填充后的字符串; 如果 key 在 YAML 中不存在, 返回空字符串 (由调用方回退到硬编码格式)
+        """
+        tpl = self.output_cfg["terminal"].get(key, "")
+        if not tpl:
+            return ""
+        return tpl.format(**kwargs)
+
+    @property
+    def stop_sequences(self) -> List[str]:
+        """
+        LLM 生成停止序列列表。
+
+        来源: YAML response.stop_sequences
+        用途: 传给 llama_cpp.Llama().__call__(stop=...), 控制模型在合适位置停止生成。
+              例如遇到 "Observation:" 时停止, 因为那是工具执行结果, 不应由模型生成。
+        """
+        return self.response_cfg.get("stop_sequences", [])
+
+    @property
+    def gen_params(self) -> Dict[str, Any]:
+        """
+        LLM 生成参数。
+
+        来源: YAML response.generation
+        包含: max_tokens, temperature 等, 用于控制生成行为。
+        """
+        return self.response_cfg.get("generation", {})
+
+    @property
+    def max_steps(self) -> int:
+        """
+        ReAct 循环最大步数 (安全阀)。
+
+        来源: YAML response.generation.max_steps
+        默认: 8
+        用途: 防止模型在无法收敛时无限循环, 达到上限后强制终止。
+        """
+        return self.response_cfg.get("generation", {}).get("max_steps", 8)
+
+
+# ==========================================
+# 1. 配置区域 (请根据实际环境修改)
+# ==========================================
+
+# 【重要】请修改为你的实际模型文件路径
+MODEL_PATH = "/home/nvidia/llama/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4_K_P.gguf"
+
+# ── NVIDIA GB10 (Grace Blackwell) 硬件优化参数 ──
+# 实际设备: DGX Spark / GB10-121G
+#   CPU: 20 核 ARM
+#   RAM: 121 GB 统一内存 (CPU/GPU 共享)
+#   GPU: GB10 (Blackwell 架构, Flash Attention 原生支持)
+#   模型: Qwen3.6-35B Q4_K_P (22 GB)
+#
+# 内存预算 (121 GB 总量):
+#   模型权重:       22 GB  (Q4_K_P 量化, 常驻)
+#   操作系统预留:     8 GB
+#   Python 运行时:    2 GB
+#   KV-Cache 32K:   ~8 GB  (35B × 2.5 层因子 × 32K × 2 bytes × 2(K+V) ≈ 8 GB)
+#   KV-Cache 64K:  ~16 GB  (线性增长)
+#   剩余空闲:      ~85 GB  (32K 时) / ~77 GB (64K 时)
+#   结论: 32K 上下文非常安全, 64K 也可尝试
+#
+# n_ctx:    上下文窗口上限。llama.cpp 按需分配 KV-Cache (增量式), 未用到的 token 不占内存。
+#           GB10 121GB 充裕: 128K 总占用 ≈ 64GB (53%) 完全可行。
+#           默认 32K — ReAct 8 轮约消耗 2~3K tokens, 32K 已有 10x 余量。
+# n_threads: CPU 线程数。GB10 有 20 核, 设为 10 (留 10 核给系统)。
+# n_batch:  批处理大小。121GB 内存充裕, 提升到 1024 增加吞吐。
+
+N_CTX = 32768
+N_GPU_LAYERS = -1      # -1 = 全部加载到 GPU (统一内存, 无拷贝开销)
+N_THREADS = 10          # 20 核 CPU, 留 10 核给系统进程
+N_BATCH = 1024
+
+# ReAct 逻辑参数
+MAX_STEPS = 8  # 最大推理步数，防止死循环
+TEMPERATURE = 0.2  # 低温度保证格式稳定
+
+# Trace 输出路径
+TRACE_OUTPUT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Qwen 模型人民币定价 (¥/千tokens)
+QWEN_PRICE = {"input": 0.004, "output": 0.012}  # Qwen3.6 35B 国内定价
+
+# ==========================================
+# 1.5. Trace 追踪系统
+# ==========================================
+
+@dataclass
+class PromptDecomposition:
+    """
+    将 ReAct prompt 分解为三段结构化数据。
+
+    用途:
+      - 追踪各段的字节数变化 (系统段应始终不变, 历史段逐步增长)
+      - 支持跨轮 Diff 计算时对比各部分是否变化
+      - HTML 报告中折叠展示各段内容
+
+    三段说明:
+      system_prompt: 固定不变的 ReAct 规则 + 工具定义 (KV-cache 最佳复用对象)
+      user_message:  用户原始问题 或 上一轮 Observation 注入的新指令 (每轮变化)
+      history_text:  累积的 Thought/Action/Observation 记录 (每轮递增 4~5 行)
+    """
+    system_prompt: str     # 固定部分: ReAct 规则 + 工具定义
+    user_message: str      # 用户输入 / 本轮 Observation 注入
+    history_text: str      # 累积的 Thought/Action/Observation 历史
+    full_prompt: str       # 原始完整 prompt (三段拼接后)
+
+    @property
+    def system_len(self) -> int:
+        """系统提示词的字符长度 (应在整个会话中保持恒定)"""
+        return len(self.system_prompt)
+
+    @property
+    def user_len(self) -> int:
+        """用户消息的字符长度 (每轮因 Observation 不同而变化)"""
+        return len(self.user_message)
+
+    @property
+    def history_len(self) -> int:
+        """历史记录的字符长度 (每轮附加 1 条记录, 逐步增长)"""
+        return len(self.history_text)
+
+
+@dataclass
+class TurnDiff:
+    """
+    相邻两轮 ReAct 调用的全量数据变化对比。
+
+    追踪维度:
+      Prompt 层:
+        - common_prefix_len: 与上一轮共享的前缀字节数 (逐字符比对)
+        - prompt_reuse_pct:  prompt 复用百分比 (≈ cached / total)
+        - system_unchanged:  系统提示词是否未变 (应始终 True, 否则为异常)
+        - history_lines_added: 本轮新增的历史行数 (正常为 4~5)
+        - user_changed:      用户消息是否变化
+
+      Response 层:
+        - thought_vs_prev: Thought 与上轮相比: new(首轮) / same(相同) / different(变化)
+        - action_vs_prev:  Action 与上轮相比:  new / same / different
+        - response_len_delta: 响应长度的变化量 (正=更长, 负=更短)
+
+      Cache 层:
+        - cached_tokens: 估算的 KV-cache 命中 token 数 (≈ common_prefix_len / 3.5)
+        - new_tokens:    本轮新增 token 数 (需重新计算的)
+    """
+    turn: int
+    # ── Prompt 维度 ──
+    common_prefix_len: int        # 与上一轮共享的前缀字符数 (逐字符比对, 系统提示词+历史)
+    new_prompt_len: int           # 本轮新增的 prompt 字符数
+    prompt_reuse_pct: float       # prompt 复用率 = common_prefix / total * 100 (%)
+    system_unchanged: bool        # 系统提示词是否未变化 (正常始终 True, False 表示异常)
+    history_lines_added: int      # 本轮比上轮新增的历史行数 (正常每轮 +4~5 行)
+    user_changed: bool            # user_message 是否变化 (每轮通常为 True)
+    # ── Response 维度 ──
+    thought_vs_prev: str          # Thought 比较: "new" (首轮) | "same" | "different"
+    action_vs_prev: str           # Action 比较:  "new" (首轮) | "same" | "different"
+    response_len_delta: int       # 本轮响应长度 - 上轮响应长度 (字符)
+    # ── Cache 估算 ──
+    cached_tokens: int            # 估算被 KV-cache 命中的 token 数 (共享前缀部分)
+    new_tokens: int               # 估算本轮新增的 token 数 (需全新计算)
+    # ── 单行摘要 ──
+    summary_line: str             # 例: "reuse 78% | history +5 lines | user changed | Thought:different"
+
+
+@dataclass
+class TraceRecord:
+    """
+    单轮 ReAct 调用的完整 Trace 记录。
+
+    包含:
+      - 原始数据: prompt / raw_output / cleaned_output
+      - 解析结果: thought / action / action_input / observation
+      - 统计指标: prompt_tokens / completion_tokens / duration_ms
+      - 全量分解: decomp (PromptDecomposition) — prompt 拆为三段
+      - 跨轮对比: diff (TurnDiff) — 与上一轮的全量差异
+      - 错误信息: parse_error (解析失败时) / status (本轮状态)
+    """
+    turn: int                              # 轮次编号 (从 1 开始)
+    question: str                          # 原始用户问题
+    timestamp: str                         # 记录时间戳 (精确到毫秒)
+    prompt_full: str                       # 完整 prompt (可直接送入 LLM)
+    prompt_snapshot: str                   # prompt 尾部快照 (最后 500 字符, 用于快速浏览)
+    raw_output: str                        # LLM 原始输出 (未经任何清洗)
+    cleaned_output: str                    # 清洗后的输出 (已去除 <think> 等标签)
+    thought: str                           # 解析出的推理过程
+    action: str                            # 解析出的动作 (工具名 / "final_answer" / "none")
+    action_input: str                      # 解析出的动作参数
+    observation: str                       # 工具执行结果 (或 "(final answer)")
+    prompt_tokens: int                     # prompt 消耗的 token 数 (来自 llama.cpp usage)
+    completion_tokens: int                 # 响应消耗的 token 数 (来自 llama.cpp usage)
+    duration_ms: float                     # LLM 调用耗时 (毫秒, 含网络/推理延迟)
+    # ── 全量数据分解 ──
+    decomp: Optional[PromptDecomposition] = None  # prompt 三段分解 (首轮起)
+    # ── 跨轮 Diff ──
+    diff: Optional[TurnDiff] = None               # 与上一轮的差异 (第 2 轮起有值)
+    # ── 错误 ──
+    parse_error: Optional[str] = None             # 解析失败时的错误消息
+    status: str = "success"                       # success | parse_error | tool_error | max_steps
+
+
+class LlamaTracer:
+    """
+    ReAct Agent 调用链全量追踪器。
+
+    追踪维度 (5 个层面):
+      1. Prompt 结构分解  — 每轮 prompt 拆为 system / user / history 三段
+      2. 跨轮 Diff 对比    — 相邻轮次间全量数据的增量变化 (新增/复用/变化)
+      3. Cache 命中率估算  — 基于公共前缀分析, 估算 KV-cache 可复用的 token 占比
+      4. Response 变化追踪 — Thought/Action 与上一轮是否相同、响应长度变化
+      5. 成本 & Token 统计 — 每轮 token 用量 + 人民币成本估算
+
+    使用方式:
+      tracer = LlamaTracer()
+      tracer.record_turn(...)   # 每轮 ReAct 调用时记录一次
+      tracer.print_summary()    # 终端打印统计摘要
+      tracer.export_html(...)   # 导出自包含 HTML 可视化报告
+
+    跨轮持久状态:
+      _last_prompt / _last_decomp / _last_response / _last_thought / _last_action
+      用于计算相邻轮次的 Diff。
+    """
+
+    def __init__(self):
+        """
+        初始化追踪器。
+
+        设置:
+          - 空记录列表 (self.records)
+          - 会话开始时间 (self.session_start)
+          - 模型名称 (从 MODEL_PATH 提取文件名)
+          - 跨轮状态变量 (全部初始化为空, 首轮无上一轮可供对比)
+        """
+        self.records: List[TraceRecord] = []
+        self.session_start = datetime.now()
+        self.model_name = os.path.basename(MODEL_PATH)
+        # ── 跨轮追踪状态 (用于计算相邻轮次的 Diff) ──
+        self._last_prompt: str = ""                           # 上一轮的完整 prompt
+        self._last_decomp: Optional[PromptDecomposition] = None  # 上一轮的 prompt 分解
+        self._last_response: str = ""                         # 上一轮的清洗后输出
+        self._last_thought: str = ""                          # 上一轮的 Thought
+        self._last_action: str = ""                           # 上一轮的 Action
+
+    # -----------------------------------------------------------------
+    # Prompt 结构分解 — 将完整 prompt 按角色段拆解
+    # -----------------------------------------------------------------
+
+    def _decompose_prompt(self, prompt: str) -> PromptDecomposition:
+        """
+        将 ReAct 格式的 prompt 按 chat_template 分隔符分解为三段。
+
+        输入格式 (Qwen2 chat_template):
+          <|im_start|>system\\n{系统提示词}<|im_end|>\\n
+          <|im_start|>user\\n{用户消息}<|im_end|>\\n
+          <|im_start|>assistant\\n{历史记录}\\nThought:
+
+        分解结果:
+          system_prompt: {系统提示词} — 固定不变, 整个会话共享
+          user_message:  {用户消息}   — 每轮可变, 携带最新 Observation
+          history_text:  {历史记录 + Thought:} — 逐步增长, 携带累积上下文
+
+        参数:
+          prompt: render_full_prompt() 生成的完整 prompt 字符串
+
+        返回:
+          PromptDecomposition 对象, 包含三段文本及其长度属性
+
+        注意:
+          - assistant 段不包含 <|im_end|> 闭合标签 (故意不闭合, 让模型续写)
+          - 如果某段匹配失败, 对应字段为空字符串 (不应发生, 除非 prompt 格式异常)
+        """
+        system_prompt = ""
+        user_message = ""
+        history_text = ""
+
+        # 提取 system 段: <|im_start|>system\n ... <|im_end|>
+        # .*? 非贪婪匹配, re.DOTALL 允许跨行
+        sys_match = re.search(r'<\|im_start\|>system\n(.*?)<\|im_end\|>', prompt, re.DOTALL)
+        if sys_match:
+            system_prompt = sys_match.group(1).strip()
+
+        # 提取 user 段: <|im_start|>user\n ... <|im_end|>
+        user_match = re.search(r'<\|im_start\|>user\n(.*?)<\|im_end\|>', prompt, re.DOTALL)
+        if user_match:
+            user_message = user_match.group(1).strip()
+
+        # 提取 assistant 段: <|im_start|>assistant\n ... (到 prompt 末尾)
+        # 注意: assistant 段没有 <|im_end|> 闭合 — 这是故意的设计, 让模型续写
+        asst_match = re.search(r'<\|im_start\|>assistant\n(.*)', prompt, re.DOTALL)
+        if asst_match:
+            history_text = asst_match.group(1).strip()
+
+        return PromptDecomposition(
+            system_prompt=system_prompt,
+            user_message=user_message,
+            history_text=history_text,
+            full_prompt=prompt,
+        )
+
+    # -----------------------------------------------------------------
+    # 跨轮 Diff 计算 — 对比相邻两轮的全量数据变化
+    # -----------------------------------------------------------------
+
+    def _compute_diff(self, current: str, prev: str, decomp: PromptDecomposition,
+                      prev_decomp: Optional[PromptDecomposition],
+                      thought: str, action: str, completion_tokens: int,
+                      response_len: int) -> TurnDiff:
+        """
+        计算本轮与上一轮的全量数据差异 — 这是 Cache 分析的核心算法。
+
+        算法分四个维度:
+
+        1. Prompt 维度 (字符级差异):
+           - 公共前缀长度: 从两个 prompt 的起始字符逐位比对, 直到第一个不同字符
+             由于 system_prompt 固定 + history 累积, 公共前缀通常 = system + user(部分) + 历史(大部分)
+           - prompt 复用率: common_prefix / total_prompt_length × 100%
+             Qwen3.6 35B 实测 60-90%, 取决于历史增长速度和 user 变化频率
+           - 系统提示词是否变化: 直接字符串比对 (应为 False, 否则是 bug)
+           - 历史新增行数: 两轮历史的行数差值 (正常每轮 +4~5 行)
+
+        2. Response 维度 (语义级差异):
+           - Thought 变化: 与上一轮的 Thought 字符串对比
+             "new" = 首轮, "same" = 模型重复思考, "different" = 正常推理差异
+           - Action 变化: 同上, 用于检测模型是否陷入重复调用同一工具的死循环
+           - 响应长度 delta: 正数=本轮更长, 负数=本轮更短
+
+        3. Cache 维度 (token 级估算):
+           - cached_tokens: common_prefix_len / 3.5 ≈ 可被 KV-cache 命中的 token 数
+             中英混合文本约 3.5 字符/token, 这是经验估算值, 非精确计算
+           - new_tokens: 本轮新增部分的 token 估算
+             这些是 LLM 需要全新计算的内容, 无法从缓存受益
+
+        4. 摘要行: 将上述所有维度压缩为一行可读文本, 用于终端 DIFF 输出
+
+        参数:
+          current:           本轮完整 prompt 字符串
+          prev:              上一轮完整 prompt 字符串 (首轮为空字符串)
+          decomp:            本轮的 prompt 分解结果
+          prev_decomp:       上一轮的 prompt 分解结果 (首轮为 None)
+          thought/action:    本轮解析出的 Thought 和 Action
+          completion_tokens: 本轮响应 token 数 (保留参数, 备用)
+          response_len:      本轮清洗后输出的字符长度
+
+        返回:
+          TurnDiff 对象, 包含所有维度的差异数据
+        """
+        turn = len(self.records) + 1
+
+        # ═══ Prompt 维度 — 字符级差异分析 ═══
+
+        # 计算公共前缀长度: 从第一个字符开始逐一比对
+        # 复杂度 O(min(len(current), len(prev))), 对 ~700 字符的 prompt 可忽略不计
+        common_len = 0
+        min_len = min(len(current), len(prev)) if prev else 0
+        for i in range(min_len):
+            if current[i] == prev[i]:
+                common_len = i + 1
+            else:
+                break
+
+        new_len = len(current) - common_len
+        reuse_pct = (common_len / len(current) * 100) if len(current) > 0 else 0.0
+
+        # 系统提示词是否变化 — 直接字符串比对
+        # 正常会话中应始终为 True (system prompt 一旦加载就不会变)
+        # 如果为 False, 说明 YAML 模板或 tools 列表在会话中发生了不应有的变化
+        system_unchanged = True
+        if prev_decomp and decomp:
+            system_unchanged = (prev_decomp.system_prompt == decomp.system_prompt)
+
+        # 历史新增行数 — 正常每轮附加 4~5 行 (Thought + Action + Action Input + Observation + 空行)
+        history_added = 0
+        if prev_decomp and decomp:
+            prev_lines = prev_decomp.history_text.count('\n')
+            curr_lines = decomp.history_text.count('\n')
+            history_added = max(0, curr_lines - prev_lines)
+
+        # user_message 是否变化 — 每轮通常都会变化 (注入了新的 Observation)
+        user_changed = True
+        if prev_decomp and decomp:
+            user_changed = (prev_decomp.user_message != decomp.user_message)
+
+        # ═══ Response 维度 — 语义级差异分析 ═══
+
+        thought_vs = "new" if not self._last_thought else (
+            "same" if thought == self._last_thought else "different")
+        action_vs = "new" if not self._last_action else (
+            "same" if action == self._last_action else "different")
+        # 响应长度变化 (字符数)
+        resp_delta = response_len - len(self._last_response) if self._last_response else response_len
+
+        # ═══ Cache 维度 — token 级估算 ═══
+
+        # 中英混合文本约 3.5 字符/token (基于 Qwen tokenizer 的经验值)
+        # 精确值需要调用 tokenizer.encode(), 但开销太大; 3.5 在生产中足够准确
+        cached_tokens = int(common_len / 3.5)
+        new_token_est = int(new_len / 3.5)
+
+        # ═══ 构建单行摘要 ═══
+
+        parts = [f"reuse {reuse_pct:.0f}%"]
+        if history_added > 0:
+            parts.append(f"history +{history_added} lines")
+        if user_changed:
+            parts.append("user changed")
+        else:
+            parts.append("user same")
+        parts.append(f"Thought:{thought_vs}")
+        parts.append(f"Action:{action_vs}")
+        if resp_delta != 0:
+            parts.append(f"resp {resp_delta:+d} chars")
+
+        return TurnDiff(
+            turn=turn,
+            common_prefix_len=common_len,
+            new_prompt_len=new_len,
+            prompt_reuse_pct=reuse_pct,
+            system_unchanged=system_unchanged,
+            history_lines_added=history_added,
+            user_changed=user_changed,
+            thought_vs_prev=thought_vs,
+            action_vs_prev=action_vs,
+            response_len_delta=resp_delta,
+            cached_tokens=cached_tokens,
+            new_tokens=new_token_est,
+            summary_line=" | ".join(parts),
+        )
+
+    # -----------------------------------------------------------------
+    # 记录 & 统计 — 每轮调用的数据持久化与会话级聚合
+    # -----------------------------------------------------------------
+
+    def record_turn(
+        self,
+        turn: int,
+        question: str,
+        prompt: str,
+        raw_output: str,
+        cleaned_output: str,
+        thought: str,
+        action: str,
+        action_input: str,
+        observation: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        duration_ms: float,
+        parse_error: Optional[str] = None,
+        status: str = "success",
+    ):
+        """
+        记录一轮 ReAct 调用的完整数据 — 这是追踪系统的核心入口。
+
+        每次 LLM 调用完成后调用此方法, 自动完成:
+          1. Prompt 结构分解 (_decompose_prompt)
+          2. 跨轮 Diff 计算 (_compute_diff)
+          3. TraceRecord 构造与存储
+          4. 跨轮状态变量更新 (为下一轮 Diff 做准备)
+          5. 终端即时输出 [DIFF] 摘要行
+
+        参数:
+          turn:              轮次编号 (从 1 开始)
+          question:          原始用户问题 (在整个多轮对话中保持不变)
+          prompt:            发送给 LLM 的完整 prompt 字符串
+          raw_output:        LLM 返回的原始输出 (未经清洗)
+          cleaned_output:    清洗后的输出 (已去除 <think> 等标签)
+          thought:           解析出的推理过程 (parse error 时为 "(Parse Error)")
+          action:            解析出的动作 (工具名 / "final_answer" / "none")
+          action_input:      解析出的动作参数
+          observation:       工具执行结果 (或 "(final answer)" / 错误信息)
+          prompt_tokens:     prompt 侧 token 消耗 (来自 llama.cpp usage.prompt_tokens)
+          completion_tokens: 响应侧 token 消耗 (来自 llama.cpp usage.completion_tokens)
+          duration_ms:       LLM 调用耗时 (从发送 prompt 到收到完整响应的毫秒数)
+          parse_error:       解析失败时的错误消息 (成功时为 None)
+          status:            本轮状态: "success" | "parse_error" | "tool_error" | "max_steps"
+
+        副作用:
+          - self.records 追加一条 TraceRecord
+          - self._last_* 全部更新为本轮数据
+          - 终端打印 [DIFF] 行
+        """
+        # Step 1: Prompt 结构分解
+        decomp = self._decompose_prompt(prompt)
+        prev_decomp = self._last_decomp
+
+        # Step 2: 计算与上一轮的差异
+        diff = self._compute_diff(
+            current=prompt, prev=self._last_prompt,
+            decomp=decomp, prev_decomp=prev_decomp,
+            thought=thought, action=action,
+            completion_tokens=completion_tokens,
+            response_len=len(cleaned_output),
+        )
+
+        # Step 3: 构造并存储 TraceRecord
+        record = TraceRecord(
+            turn=turn,
+            question=question,
+            timestamp=datetime.now().strftime("%H:%M:%S.%f")[:-3],  # 精确到毫秒, 去掉最后 3 位微秒
+            prompt_full=prompt,
+            prompt_snapshot=prompt[-500:],  # 只保留最后 500 字符作为快速预览
+            raw_output=raw_output,
+            cleaned_output=cleaned_output,
+            thought=thought,
+            action=action,
+            action_input=action_input,
+            observation=observation,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            duration_ms=duration_ms,
+            decomp=decomp,
+            diff=diff,
+            parse_error=parse_error,
+            status=status,
+        )
+        self.records.append(record)
+
+        # Step 4: 更新跨轮状态 (为下一轮 Diff 做准备)
+        self._last_prompt = prompt
+        self._last_decomp = decomp
+        self._last_response = cleaned_output
+        self._last_thought = thought
+        self._last_action = action
+
+        # Step 5: 终端即时输出 diff 摘要
+        if diff and turn > 1:
+            # 非首轮: 打印完整的差异摘要行
+            ts_print(f"[DIFF] {diff.summary_line}")
+        elif diff and turn == 1:
+            # 首轮: 只打印 prompt 初始结构 (无上一轮可对比)
+            ts_print(f"[DIFF] initial prompt | system={decomp.system_len} chars | "
+                  f"user={decomp.user_len} chars | history={decomp.history_len} chars")
+
+    def summary(self) -> Dict[str, Any]:
+        """
+        计算会话级别的聚合统计摘要。
+
+        聚合维度:
+          - Token 用量: 所有轮次的 prompt/completion/total tokens 求和
+          - 成本估算: 按 QWEN_PRICE 计算人民币成本
+          - Cache 分析: 累计缓存命中 token 数 / 命中率 / 平均 prompt 复用率
+          - 错误统计: 解析错误轮次数 / 工具调用轮次数
+          - 异常检测: 系统提示词变化次数 (应为 0)
+
+        返回:
+          字典, 包含所有聚合指标, 供 print_summary() 和 export_html() 使用
+
+        注意:
+          - prompt 复用率排除首轮 (首轮无上一轮可对比, 复用率无定义)
+          - cache_hit_rate = cached_tokens / (cached_tokens + new_tokens) × 100%
+            (仅在首轮有意义的会话中可能偏高, 因为有固定的 system prompt 占据大量共享前缀)
+        """
+        total_turns = len(self.records)
+        total_prompt = sum(r.prompt_tokens for r in self.records)
+        total_completion = sum(r.completion_tokens for r in self.records)
+        total_duration = sum(r.duration_ms for r in self.records)
+        error_turns = [r for r in self.records if r.status != "success"]
+        tool_calls = [r for r in self.records if r.action not in ("final_answer", "none", "")]
+
+        # ═══ Cache 统计 ═══
+        total_cached = sum(r.diff.cached_tokens for r in self.records if r.diff)
+        total_new = sum(r.diff.new_tokens for r in self.records if r.diff)
+        total_est_prompt_tokens = total_cached + total_new
+        cache_hit_rate = (total_cached / total_est_prompt_tokens * 100) if total_est_prompt_tokens > 0 else 0.0
+        # 系统提示词变化次数 — 应为 0, 非零表示存在 bug
+        system_change_count = sum(1 for r in self.records if r.diff and not r.diff.system_unchanged)
+
+        # 平均 prompt 复用率 — 排除首轮 (首轮无上一轮, 复用率无意义)
+        reuse_rates = [r.diff.prompt_reuse_pct for r in self.records[1:] if r.diff]
+        avg_reuse = sum(reuse_rates) / len(reuse_rates) if reuse_rates else 0.0
+
+        return {
+            "model": self.model_name,
+            "session_duration_s": (datetime.now() - self.session_start).total_seconds(),
+            "total_turns": total_turns,
+            "total_prompt_tokens": total_prompt,
+            "total_completion_tokens": total_completion,
+            "total_tokens": total_prompt + total_completion,
+            "total_duration_ms": total_duration,
+            "error_turns": len(error_turns),
+            "tool_calls": len(tool_calls),
+            "cost_rmb": (total_prompt * QWEN_PRICE["input"] + total_completion * QWEN_PRICE["output"]) / 1000,
+            # Cache 维度
+            "estimated_cached_tokens": total_cached,
+            "estimated_new_tokens": total_new,
+            "cache_hit_rate": cache_hit_rate,
+            "avg_prompt_reuse_pct": avg_reuse,
+            "system_change_count": system_change_count,
+        }
+
+    def print_summary(self):
+        """
+        终端打印追踪摘要报告 — ASCII 艺术框, 含 Cache 可视化进度条。
+
+        输出内容:
+          上半部分: Token 用量 (prompt / completion / total)
+          下半部分: Cache 分析 (cached tokens / new tokens / hit rate / reuse / system changes)
+          底部:     成本 + 工具调用 + 错误 + LLM 耗时
+
+        进度条:
+          使用 Unicode 块元素 (█░) 绘制, 宽度 30 字符。
+          cache_hit_rate 和 avg_prompt_reuse_pct 各有独立进度条。
+        """
+        s = self.summary()
+        cache_bar = self._bar(s['cache_hit_rate'], 30)
+        reuse_bar = self._bar(s['avg_prompt_reuse_pct'], 30)
+        ts_print(f"""
+╔══════════════════════════════════════════════════════════╗
+║              ReAct Trace Report                          ║
+╠══════════════════════════════════════════════════════════╣
+║  Model: {s['model'][:46]:<46s} ║
+║  Turns: {s['total_turns']:<5}  Duration: {s['session_duration_s']:.1f}s{'':>30s} ║
+╠══════════════════════════════════════════════════════════╣
+║  Token Usage                                            ║
+║    Prompt tokens:      {s['total_prompt_tokens']:>8,d}                          ║
+║    Completion tokens:  {s['total_completion_tokens']:>8,d}                          ║
+║    Total:              {s['total_tokens']:>8,d}                          ║
+╠══════════════════════════════════════════════════════════╣
+║  Cache Analysis (estimated)                             ║
+║    Cached tokens:      {s['estimated_cached_tokens']:>8,d}  [{cache_bar}] ║
+║    New tokens:         {s['estimated_new_tokens']:>8,d}                          ║
+║    Cache hit rate:     {s['cache_hit_rate']:>6.1f}%                             ║
+║    Avg prompt reuse:   {s['avg_prompt_reuse_pct']:>6.1f}%  [{reuse_bar}] ║
+║    System changes:     {s['system_change_count']} (should be 0)                          ║
+╠══════════════════════════════════════════════════════════╣
+║  Cost: ¥{s['cost_rmb']:.6f}  |  Tools: {s['tool_calls']}  |  Errors: {s['error_turns']}  |  LLM: {s['total_duration_ms']:.0f}ms ║
+╚══════════════════════════════════════════════════════════╝
+""")
+
+    @staticmethod
+    def _bar(pct: float, width: int) -> str:
+        """
+        绘制终端进度条 — 用于 print_summary 中的可视化展示。
+
+        参数:
+          pct:   百分比值 (0-100)
+          width: 进度条总宽度 (字符数)
+
+        返回:
+          由 █ (已填充) 和 ░ (未填充) 组成的字符串
+
+        示例:
+          _bar(64.8, 10) → "██████░░░░"
+        """
+        filled = int(pct / 100 * width)
+        return "█" * filled + "░" * (width - filled)
+
+    # -----------------------------------------------------------------
+    # HTML 导出 — 委托给专业 UX 渲染模块
+    # -----------------------------------------------------------------
+
+    def export_html(self, filepath: str):
+        """
+        导出自包含 HTML 可视化报告。
+
+        实现: 委托给 ReActTraceRenderer.render_html(), 该模块负责:
+          - Dark/Light 双主题 (CSS custom properties)
+          - 设计系统驱动的卡片布局 (8px grid, Inter 字体)
+          - 每轮 ReAct 的详细 Diff 面板 (9 维度指标)
+          - Prompt 三段分解折叠面板
+          - 原始输出折叠区
+          - 主题切换按钮 (localStorage 持久化)
+
+        参数:
+          filepath: 输出 HTML 文件的绝对路径
+        """
+        from ReActTraceRenderer import render_html
+        render_html(self.records, self.summary(), self.session_start, filepath)
+        return
+
+    @staticmethod
+    def _escape(text: str) -> str:
+        """
+        HTML 实体转义 — 防止 XSS 和渲染错误。
+
+        转义规则:
+          & → &amp;  (必须第一个, 否则会重复转义)
+          < → &lt;
+          > → &gt;
+          " → &quot;
+
+        参数:
+          text: 原始文本 (可能包含 HTML 特殊字符)
+
+        返回:
+          转义后的安全文本
+        """
+        return (text or "").replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;')
+
+# ==========================================
+# 2. 工具定义 (Tools) — Agent 可调用的外部能力
+# ==========================================
+
+@tool
+def calculator(expression: str) -> str:
+    """
+    数学计算器工具 — 执行基本算术运算。
+
+    功能:
+      安全地 eval 数学表达式, 支持 + - * / ** () 等运算符。
+
+    参数:
+      expression: 数学表达式字符串, 例如 '2 + 2' 或 '10 * 5' 或 '(25 - 32) * 5 / 9'
+
+    返回:
+      计算结果字符串, 如 "4", "50", "-3.888888888888889"
+      如果表达式非法, 返回 "Error: {错误信息}"
+
+    安全措施:
+      eval 时传入空 __builtins__ 字典, 阻止任意代码执行。
+      只允许纯数学运算, 无法访问系统、文件、网络。
+    """
+    try:
+        # {"__builtins__": {}} 是关键安全措施: 禁用所有内置函数, 只允许数学运算符
+        result = eval(expression, {"__builtins__": {}}, {})
+        return str(result)
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+@tool
+def get_weather(city: str) -> str:
+    """
+    天气查询工具 — 获取指定城市的天气信息。
+
+    功能:
+      查询预设城市的天气数据 (模拟数据库, 非实时 API)。
+
+    参数:
+      city: 城市名 (英文), 如 "London", "Tokyo", "New York", "Paris"
+
+    返回:
+      天气描述字符串, 如 "Rainy, 12°C" 或 "Sunny, 25°C"
+      如果城市不在数据库中, 返回 "Weather data not found for this city."
+
+    注意:
+      这是一个模拟工具, 实际部署时应替换为真实的天气 API 调用。
+      模型可能错误地将非数据库中的城市名传入, 需要做好错误处理。
+    """
+    # 模拟数据库 — 生产环境中应替换为 API 调用
+    weather_db = {
+        "London": "Rainy, 12°C",
+        "Tokyo": "Sunny, 25°C",
+        "New York": "Cloudy, 18°C",
+        "Paris": "Sunny, 20°C"
+    }
+    return weather_db.get(city, "Weather data not found for this city.")
+
+# 注册所有可用工具
+TOOLS = [calculator, get_weather]
+
+# ==========================================
+# 3. LLM 初始化 — 加载本地 GGUF 模型
+# ==========================================
+
+def init_llm():
+    """
+    初始化本地 LLM 实例 — 使用 llama-cpp-python 加载 GGUF 量化模型。
+
+    加载流程:
+      1. 检查模型文件是否存在
+      2. 打印加载参数 (context / gpu_layers / threads)
+      3. 调用 Llama() 构造函数加载模型
+      4. 加载成功: 返回 Llama 实例
+      5. 加载失败: 打印错误提示并退出
+
+    硬件适配 (NVIDIA GB10 Grace Blackwell / DGX Spark):
+      - n_ctx=32768:     上下文窗口 32K (GB10 121GB 统一内存, 充裕)
+      - n_gpu_layers=-1:  全部层加载到 GPU (统一内存架构, 无 CPU↔GPU 拷贝开销)
+      - flash_attn=True:  开启 Flash Attention (Blackwell 架构原生支持, 显著提升速度)
+      - n_threads=10:     CPU 推理线程数 (GB10 20 核, 留 10 核给系统)
+      - n_batch=1024:     批处理大小提升 (内存充裕)
+
+    Qwen 模型特殊配置:
+      - chat_format="qwen2": 必需! 否则模型不会正确解析 <|im_start|> / <|im_end|> 标记
+      - rope_scaling_type=1: LLAMA_ROPE_SCALING_TYPE_LINEAR, 新版 llama-cpp-python 要求整数
+      - repeat_penalty=1.15:  轻微抑制重复输出, 防止模型在 ReAct 循环中陷入复读
+
+    返回:
+      llama_cpp.Llama 实例 (已加载并可用)
+
+    异常:
+      FileNotFoundError: 模型文件不存在
+      SystemExit(1):     模型加载过程中发生任何错误 (CUDA OOM / 参数错误 / 内存不足)
+    """
+    if not os.path.exists(MODEL_PATH):
+        raise FileNotFoundError(f"[FATAL] Model file not found: {MODEL_PATH}\nCheck the path and try again.")
+
+    ts_print(f"[INIT] Loading model: {MODEL_PATH}")
+    ts_print(f"       context={N_CTX}  gpu_layers={N_GPU_LAYERS}  threads={N_THREADS}")
+
+    try:
+        llm = Llama(
+            model_path=MODEL_PATH,
+            n_ctx=N_CTX,                    # 上下文窗口 (字符数)
+            n_gpu_layers=N_GPU_LAYERS,      # GPU 层数: -1=全部, 0=纯CPU
+            n_threads=N_THREADS,             # CPU 线程数
+            n_batch=N_BATCH,                 # 批处理大小 (影响吞吐)
+            verbose=False,                          # 关闭 llama.cpp 详细日志, 避免污染输出
+            chat_format="qwen2",                    # Qwen 系列专用 chat_template
+            temp=TEMPERATURE,                       # 采样温度
+            top_p=0.95,                             # nucleus sampling 阈值
+            repeat_penalty=1.15,                    # 重复惩罚因子 (>1.0 = 抑制重复)
+            rope_scaling_type=1,                    # RoPE 缩放类型: 1=LINEAR (适应超长上下文)
+            flash_attn=True,                        # Flash Attention 加速 (Blackwell 架构原生支持)
+        )
+        ts_print("[INIT] Model loaded successfully.")
+        return llm
+    except Exception as e:
+        ts_print(f"[FATAL] Model load failed: {e}")
+        ts_print("[HINT] If CUDA OOM, try reducing N_CTX or set N_GPU_LAYERS=0 (CPU-only mode).")
+        sys.exit(1)
+
+# ==========================================
+# 4. ReAct 核心逻辑
+# ==========================================
+
+def clean_qwen_output(raw_text: str) -> str:
+    """
+    清理 Qwen 思考模型的输出标签 — 提取纯文本。
+
+    Qwen3.6 思考模型的原始输出格式:
+      <think>内部推理过程 (对 Agent 无用, 应清除)</think>
+      <response>结构化输出 (Thought/Action/Action Input)</response>
+
+    清洗步骤:
+      1. 移除 <think>...</think> 标签及其全部内容 (正则 .*? 非贪婪 + re.DOTALL 跨行)
+      2. 移除残留的 <response> / </response> / </think> 空标签
+      3. 去除首尾空白字符
+
+    参数:
+      raw_text: LLM 返回的原始文本 (可能包含 Qwen 思考标签)
+
+    返回:
+      清洗后的纯文本; 若模型未输出 think/response 标签, 清洗后与原始文本基本相同
+
+    注意:
+      如果 prompt 中已禁止使用 <think> 标签 (如 YAML 模板中的约束),
+      此函数的清洗可能不产生任何效果 (模型输出中本就没有这些标签)。
+    """
+    # 移除  标签及其内容（保留标签后的内容）
+    cleaned = re.sub(r'<think>.*?</think>', '', raw_text, flags=re.DOTALL)
+    # 移除  response 和  标签
+    cleaned = re.sub(r'<response>|</response>|<\s*/\s*think\s*>', '', cleaned, flags=re.DOTALL)
+    return cleaned.strip()
+
+
+def get_react_prompt(question: str, history: List[str]) -> str:
+    """
+    构建 ReAct 格式的 Prompt — 内置回退实现。
+
+    与 ProtocolLoader.render_full_prompt() 功能相同, 但使用硬编码模板。
+    当 ReActProtocol.yaml 不可用时 (如 pyyaml 未安装), 自动回退到此函数。
+
+    参数:
+      question: 用户问题 或 Observation 反馈注入的新指令
+      history:  历史记录列表 (每项为一条 Thought/Action/ActionInput/Observation)
+
+    返回:
+      完整 prompt 字符串, 可直接送入 llama_cpp.Llama().__call__()
+
+    模板结构 (Qwen2 chat_template):
+      <|im_start|>system     ← ReAct 规则 + 可用工具列表 (固定前缀, 每轮不变)
+      <|im_start|>user       ← 用户问题 (每轮可变, 携带最新 Observation)
+      <|im_start|>assistant  ← 累积历史记录 + "Thought:" 触发词 (让模型续写)
+    """
+    tools_desc = "\n".join([f"- {t.name}: {t.description}" for t in TOOLS])
+    tool_names = ', '.join([t.name for t in TOOLS])
+    history_str = "\n".join(history) if history else ""
+
+    # 使用 Qwen 能更好理解的格式，加入更强的格式约束
+    prompt = f"""<|im_start|>system
+You are a ReAct agent. You MUST follow the EXACT format below. Do NOT add extra explanations, do NOT use <think> tags, just follow the format:
+
+Format rules:
+- After "Thought:" write your reasoning in ONE line
+- After "Action:" write ONLY the tool name: {tool_names}
+- After "Action Input:" write the tool input
+- After you have the answer, use "Final Answer:"
+
+Available tools:
+{tools_desc}<|im_end|>
+<|im_start|>user
+{question}<|im_end|>
+<|im_start|>assistant
+{history_str}
+Thought:"""
+
+    return prompt
+
+
+def parse_llm_output(output: str) -> Dict[str, str]:
+    """
+    解析 LLM 输出 — 内置回退实现 (四级解析 + 工具名回退)。
+
+    与 ProtocolLoader.parse_response() 功能相同, 但使用硬编码正则表达式。
+
+    解析优先级 (P1~P4):
+      P1: 检测 "Final Answer:"  → 直接返回最终答案, 终止 ReAct 循环
+      P2: 提取 "Thought:"       → 模型的推理过程 (可选字段)
+      P3: 提取 "Action:"        → 模型选择的工具名 (必须字段, 失败时触发工具名回退)
+      P4: 提取 "Action Input:"  → 传给工具的参数 (可选字段)
+
+    回退策略:
+      - Action 正则失败:  在输出文本中扫描已注册工具的名称
+      - Action Input 失败: 取 Action 行之后的第一行非空文本
+      - Thought 失败:      取输出的第一行作为 Thought
+
+    参数:
+      output: LLM 返回的文本 (未清洗, 函数内部会先调用 clean_qwen_output)
+
+    返回:
+      {"thought": str, "action": str, "action_input": str}
+
+    异常:
+      ValueError: 所有解析策略均失败 (模型输出完全不遵循 ReAct 协议)
+    """
+    # 0. 清理 Qwen 思考标签
+    clean = clean_qwen_output(output)
+    if not clean:
+        clean = output.strip()
+
+    # Step 1: P1 检测 Final Answer — 最高优先级, 命中即终止 ReAct 循环
+    fa_match = re.search(r"Final Answer:\s*(.*)", clean, re.DOTALL)
+    if fa_match:
+        final_answer = fa_match.group(1).strip()
+        return {
+            "thought": "I now know the final answer",
+            "action": "final_answer",
+            "action_input": final_answer
+        }
+
+    # Step 2: P2 提取 Thought — 模型的推理过程 (可选字段)
+    thought = ""
+    thought_match = re.search(r"Thought:\s*(.+?)(?=\n(?:Action|Final)|$)", clean, re.DOTALL)
+    if thought_match:
+        thought = thought_match.group(1).strip()
+
+    # Step 3: P3 提取 Action — 必须字段 (工具名)
+    action_match = re.search(r"Action:\s*(\S+)", clean)
+    if not action_match:
+        # ── 回退策略: 在输出文本中扫描已注册工具的名称 ──
+        for t in TOOLS:
+            if t.name in clean:
+                action_match = re.search(rf"{t.name}\s*(.*)", clean)
+                if action_match:
+                    return {
+                        "thought": thought or clean.split('\n')[0].strip(),
+                        "action": t.name,
+                        "action_input": action_match.group(1).strip().strip('()"\'') or clean.strip()
+                    }
+        raise ValueError(f"No 'Action:' found in LLM output. Got: {clean[:200]}")
+
+    action = action_match.group(1).strip()
+
+    # Step 4: P4 提取 Action Input — 传给工具的参数 (可选字段)
+    ai_match = re.search(r"Action Input:\s*(.+?)(?=\n(?:Thought|Action|Final|Observation)|$)", clean, re.DOTALL)
+    if ai_match:
+        action_input = ai_match.group(1).strip()
+    else:
+        # ── 回退策略: 取 Action 行之后的第一行文本作为 Input ──
+        rest = clean[action_match.end():].strip()
+        action_input = rest.split('\n')[0].strip() if rest else ""
+
+    # ── 兜底: 若 Thought 仍未提取到, 用输出第一行 ──
+    if not thought:
+        first_line = clean.split('\n')[0].strip()
+        thought = first_line if first_line else "(reasoning)"
+
+    return {
+        "thought": thought,
+        "action": action,
+        "action_input": action_input
+    }
+
+def run_react_agent(llm: Llama, question: str, max_steps: int = MAX_STEPS,
+                     tracer: Optional['LlamaTracer'] = None,
+                     protocol: Optional['ProtocolLoader'] = None):
+    """
+    运行 ReAct Agent 主循环 — 支持 YAML Protocol 驱动。
+
+    这是整个 ReAct 系统的核心控制循环, 负责:
+      1. Prompt 构建: 调用 protocol.render_full_prompt() 或内置 get_react_prompt()
+      2. LLM 推理: 调用 llama_cpp.Llama() 发送 prompt 并接收原始输出
+      3. 输出解析: 调用 protocol.parse_response() 或内置 parse_llm_output()
+      4. 工具执行: 匹配并调用已注册的 langchain @tool 函数
+      5. 历史管理: 将每轮的 Thought/Action/Observation 追加到历史列表
+      6. 循环控制: 检测 Final Answer 终止, 或达到 max_steps 上限
+
+    双路径设计:
+      当 protocol 参数非 None 时 (加载了 YAML 协议模板):
+        - prompt 构建 / response 解析 / 日志输出 全部由协议模板驱动
+        - 可通过修改 YAML 文件切换模型、调整格式, 无需改代码
+      当 protocol 参数为 None 时 (YAML 不可用):
+        - 回退到内置的 get_react_prompt() / parse_llm_output() / 硬编码日志格式
+        - 保证脚本在任何环境下都能独立运行
+
+    参数:
+      llm:       已初始化的 llama_cpp.Llama 实例
+      question:  用户问题字符串
+      max_steps: 最大 ReAct 循环步数 (安全阀, 防止无限循环)
+      tracer:    LlamaTracer 实例 (可选, 用于全量数据追踪)
+      protocol:  ProtocolLoader 实例 (可选, 用于 YAML 协议驱动)
+
+    返回:
+      最终答案字符串 (来自 Final Answer), 或 "Agent stopped due to max steps."
+    """
+
+    if protocol is None:
+        proto_path = os.path.join(TRACE_OUTPUT_DIR, "ReActProtocol.yaml")
+        if os.path.exists(proto_path):
+            protocol = ProtocolLoader(proto_path)
+
+    # ── 函数指针: 有 protocol 则用 protocol 方法, 否则回退到内置函数 ──
+    _render_prompt = (lambda q, h: protocol.render_full_prompt(TOOLS, q, "\n".join(h) if h else "")) \
+        if protocol else (lambda q, h: get_react_prompt(q, h))
+    _preprocess = protocol.preprocess_output if protocol else clean_qwen_output
+    _parse = (lambda out: protocol.parse_response(out, TOOLS)) if protocol else parse_llm_output
+    _stop = protocol.stop_sequences if protocol else ["Observation:", "\n<|im_end|>", "<|im_end|>"]
+    _fmt = protocol.fmt if protocol else (lambda k, **kw: "")
+
+    history = []
+    current_input = question
+
+    ts_print(_fmt("agent_start") or f"\n[AGENT] === ReAct loop start ===")
+    ts_print(_fmt("agent_question", question=question) or f"[AGENT] Question: {question}\n")
+
+    for step in range(1, max_steps + 1):
+        ts_print(_fmt("step_header", step=step) or f"[STEP {step}] --------------------------------------------------")
+        t_start = time.time()
+
+        # ═══ Step 1: 构建 Prompt 并调用 LLM ═══
+        prompt = _render_prompt(current_input, history)
+
+        response = llm(
+            prompt,
+            max_tokens=512,
+            stop=_stop,
+            temperature=TEMPERATURE
+        )
+        duration_ms = (time.time() - t_start) * 1000
+
+        raw_output = response["choices"][0]["text"]
+        llm_output = _preprocess(raw_output)
+
+        # ── 获取 token 用量 (来自 llama.cpp usage 字段) ──
+        usage = response.get("usage", {})
+        prompt_tokens = usage.get("prompt_tokens", len(prompt) // 4)
+        completion_tokens = usage.get("completion_tokens", len(raw_output) // 4)
+
+        ts_print(_fmt("llm_raw", raw_output=raw_output[:200]) or f"[LLM] Raw: {raw_output[:200]}")
+        ts_print(_fmt("llm_tokens", prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens, duration_ms=f"{duration_ms:.0f}")
+              or f"[LLM] tokens: prompt={prompt_tokens}  completion={completion_tokens}  duration={duration_ms:.0f}ms")
+
+        # ═══ Step 2: 解析 LLM 输出 ═══
+        parse_error = None
+        try:
+            parsed = _parse(llm_output)
+        except ValueError as e:
+            ts_print(_fmt("error_parse", error=str(e)) or f"[ERROR] Parse failed: {e}")
+            parse_error = str(e)
+            # ── Error Recovery: 将解析失败的输出作为 Observation 反馈给模型, 让它重试 ──
+            if tracer:
+                tracer.record_turn(
+                    turn=step, question=question, prompt=prompt,
+                    raw_output=raw_output, cleaned_output=llm_output,
+                    thought="(Parse Error)", action="none", action_input="none",
+                    observation=llm_output,
+                    prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+                    duration_ms=duration_ms, parse_error=parse_error, status="parse_error"
+                )
+            history.append(
+                f"Thought: (Parse Error)\n"
+                f"Action: none\n"
+                f"Action Input: none\n"
+                f"Observation: {llm_output}"
+            )
+            current_input = f"Based on the observation, try again.\nObservation: {llm_output}"
+            continue
+
+        thought = parsed["thought"]
+        action = parsed["action"]
+        action_input = parsed["action_input"]
+
+        ts_print(_fmt("trace_thought", thought=thought) or f"[TRACE] Thought: {thought}")
+        ts_print(_fmt("trace_action", action=action) or f"[TRACE] Action: {action}")
+        ts_print(_fmt("trace_input", action_input=action_input) or f"[TRACE] Input: {action_input}")
+
+        # ═══ Step 3: 执行 Action (工具调用 或 返回最终答案) ═══
+        if action == "final_answer":
+            final_answer = action_input
+            ts_print(_fmt("result_final", answer=action_input) or f"\n[RESULT] Final Answer: {final_answer}\n")
+            if tracer:
+                tracer.record_turn(
+                    turn=step, question=question, prompt=prompt,
+                    raw_output=raw_output, cleaned_output=llm_output,
+                    thought=thought, action=action, action_input=action_input,
+                    observation="(final answer)",
+                    prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+                    duration_ms=duration_ms, status="success"
+                )
+            return final_answer
+
+        # ── 在已注册的工具列表中查找匹配的工具函数 ──
+        tool_obj = next((t for t in TOOLS if t.name == action), None)
+
+        tool_error = False
+        if not tool_obj:
+            observation = f"Unknown action: '{action}'. Available actions: {[t.name for t in TOOLS]}"
+            tool_error = True
+        else:
+            try:
+                observation = tool_obj.invoke(action_input)
+            except Exception as e:
+                observation = f"Tool execution error: {str(e)}"
+                tool_error = True
+
+        ts_print(_fmt("trace_obs", observation=observation) or f"[TRACE] Observation: {observation}\n")
+
+        # ── Trace: 将本轮完整数据记录到追踪器 ──
+        if tracer:
+            tracer.record_turn(
+                turn=step, question=question, prompt=prompt,
+                raw_output=raw_output, cleaned_output=llm_output,
+                thought=thought, action=action, action_input=action_input,
+                observation=observation,
+                prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+                duration_ms=duration_ms,
+                status="tool_error" if tool_error else "success"
+            )
+
+        # ═══ Step 4: 更新历史记录 (按协议模板格式化) ═══
+        if protocol:
+            history.append(protocol.render_history_entry(
+                thought=thought, action=action,
+                action_input=action_input, observation=observation))
+        else:
+            history.append(
+                f"Thought: {thought}\n"
+                f"Action: {action}\n"
+                f"Action Input: {action_input}\n"
+                f"Observation: {observation}\n"
+            )
+
+        # ═══ Step 5: 准备下一轮输入 (注入新 Observation) ═══
+        current_input = f"Based on the observation, what should I do next?\nObservation: {observation}"
+
+    ts_print(_fmt("warn_max_steps", max_steps=max_steps) or f"[WARN] Max steps ({max_steps}) reached. Loop terminated.")
+    return "Agent stopped due to max steps."
+
+# ==========================================
+# 5. 主程序入口
+# ==========================================
+
+if __name__ == "__main__":
+    # ── Step 1: 初始化本地 LLM 实例 (加载 GGUF 模型) ──
+    try:
+        llm = init_llm()
+    except Exception as e:
+        ts_print(f"[FATAL] Initialization failed: {e}")
+        sys.exit(1)
+
+    # ── Step 2: 初始化全量数据追踪器 ──
+    tracer = LlamaTracer()
+
+    # ── Step 3: 加载 ReAct 协议模板 (YAML 驱动交互格式, 可选) ──
+    proto_path = os.path.join(TRACE_OUTPUT_DIR, "ReActProtocol.yaml")
+    protocol = ProtocolLoader(proto_path) if os.path.exists(proto_path) else None
+    ts_print(f"[TRACE] Session started. Model: {tracer.model_name}  Protocol: {'YAML' if protocol else 'built-in'}")
+
+    # ── Step 4: 定义测试问题列表 ──
+    test_questions = [
+        "What is 123 multiplied by 45?",
+        "What is the weather in London multiplied by 2?",
+        "Tell me the weather in Tokyo and then add 10 to it.",
+    ]
+
+    for q in test_questions:
+        result = run_react_agent(llm, q, tracer=tracer, protocol=protocol)
+        ts_print(protocol.fmt("result_line", result=result) if protocol else f"[RESULT] {result}")
+        ts_print("-" * 50)
+
+    # 打印追踪摘要
+    tracer.print_summary()
+
+    # ── Step 6: 导出自包含 HTML 可视化报告 ──
+    html_path = os.path.join(TRACE_OUTPUT_DIR, "ReActTrace.html")
+    tracer.export_html(html_path)

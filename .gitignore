@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+*.bak
+ReActTrace.html          # 生成文件, 不纳入版本控制
+*.gguf                   # 模型文件过大, 不纳入版本控制
+
+# Jupyter
+.ipynb_checkpoints/
+# test line
+doc/GIT_SETUP.md
