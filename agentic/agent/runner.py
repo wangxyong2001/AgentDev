@@ -76,8 +76,7 @@ class AgentCore:
         Raises:
           Only fatal errors — recoverable errors are handled in-loop.
         """
-        logger.agent("=== ReAct loop start ===")
-        logger.agent(f"Question: {question}")
+        logger.info(f"{'═'*50}\n  Question: {question}")
 
         history: List[str] = []
         current_input = question
@@ -85,7 +84,7 @@ class AgentCore:
         tool_descs = {t.name: t.description for t in self._registry.list_tools()}
 
         for step in range(1, self.max_steps + 1):
-            logger.step(f"--- Step {step} ---")
+            logger.info(f"{'─'*40}\n  Step {step}/{self.max_steps}")
             t_start = time.time()
 
             # ── State: PROMPT_BUILD ──
@@ -102,12 +101,8 @@ class AgentCore:
                 temperature=self._template.temperature,
             )
 
+            logger.info(f"LLM: {response.prompt_tokens}p+{response.completion_tokens}c tokens, {response.duration_ms:.0f}ms")
             logger.debug(f"Raw: {response.text[:200]}")
-            logger.llm(
-                prompt_tokens=response.prompt_tokens,
-                completion_tokens=response.completion_tokens,
-                duration_ms=response.duration_ms,
-            )
 
             # ── State: PARSE ──
             parse_error = None
@@ -145,13 +140,13 @@ class AgentCore:
             action = parsed["action"]
             action_input = parsed["action_input"]
 
-            logger.trace(f"Thought: {thought}")
-            logger.trace(f"Action: {action}")
+            logger.info(f"  Thought: {thought}")
+            logger.info(f"  Action: {action}({action_input})")
             logger.trace(f"Input: {action_input}")
 
             # ── State: DISPATCH → FINAL_ANSWER ──
             if action == "final_answer":
-                logger.result(f"Final Answer: {action_input}")
+                logger.info(f"  Final Answer: {action_input}")
                 if self._collector:
                     self._collector.record_turn(
                         turn=step, question=question, prompt=prompt,
@@ -179,7 +174,7 @@ class AgentCore:
                 observation = f"Tool execution error: {e.original_error}"
                 tool_error = True
 
-            logger.trace(f"Observation: {observation}")
+            logger.info(f"  Observation: {observation}")
 
             # ── Trace ──
             if self._collector:
