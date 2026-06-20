@@ -143,4 +143,57 @@ agent = AgentCore(
 
 ---
 
-> **下次回顾**: Phase 2 结束后检查 INC-001 预防措施的执行情况
+## INC-002: 分支合并导致 viewer.py 修复丢失
+
+| 属性 | 值 |
+|------|-----|
+| **事件编号** | INC-002 |
+| **严重级别** | P3 — 工具缺陷（viewer.py 崩溃） |
+| **关联事件** | INC-001（审计账本为空时 viewer 崩溃） |
+| **发现日期** | 2026-06-21 |
+| **修复日期** | 2026-06-21 |
+| **关联提交** | `cb90e3f` |
+
+### 问题描述
+
+INC-001 修复后，用户运行 `agentic/db/viewer.py` 仍然崩溃，报错路径为：
+
+1. **IndentationError**: `if args.last:` 后缺少语句体（空行）
+2. **TypeError: tuple indices**: `cmd_stats` 中 `conn.row_factory = sqlite3.Row` 丢失
+3. **TypeError: NoneType.__format__**: SQL 中 `SUM()` 未用 `COALESCE` 包裹
+
+三个缺陷在 INC-001 修复时均已处理，但在后续分支合并操作中被覆盖丢失。
+
+### 根因分析
+
+**直接原因**: 多次 `git merge` 操作中，`agentic/db/viewer.py` 的早期修复（`row_factory` + `COALESCE`）被更早版本的文件内容覆盖。
+
+**深层原因**:
+1. `viewer.py` 是在 INC-001 事件处理的后期才创建的，处于多次提交的中间位置
+2. 分支合并时 Git 对 viewer.py 的冲突解决使用了较旧版本的代码
+3. 合并后未执行 `viewer.py` 的冒烟测试（空数据库场景）
+
+### 纠正措施
+
+在 `cmd_stats` 函数中一次性修复三个缺陷：
+1. 添加 `conn.row_factory = sqlite3.Row`
+2. SQL 中所有 `SUM()` 改为 `COALESCE(SUM(...), 0)`
+3. 补充 `if args.last:` 缺失的 `cmd_last(db_path, args.last)` 调用
+
+### 预防措施
+
+| # | 措施 | 优先级 |
+|---|------|--------|
+| 1 | `git merge` 后运行 `python agentic/db/viewer.py` 作为冒烟测试 | P0 |
+| 2 | 将 viewer.py 纳入 pytest（模拟空数据库场景） | P1 |
+| 3 | `.github/workflows/` CI 中增加 viewer 冒烟步骤 | P2 |
+
+### 经验教训
+
+1. **合并后回归测试不可省略** — 快速 `git merge` 后运行 `pytest` 只能验证已有测试覆盖的模块。viewer.py 是纯工具脚本，不在 pytest 覆盖范围内。合并后必须对关键工具脚本做冒烟测试。
+
+2. **工具脚本也应纳入测试覆盖** — viewer.py 的 `cmd_stats` / `cmd_last` 应该作为 pytest 测试用例（mock SQLite 连接），这样合并后 CI 会立即发现回归。
+
+---
+
+> **下次回顾**: Phase 2 结束后检查 INC-001 和 INC-002 预防措施的执行情况
