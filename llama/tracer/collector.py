@@ -267,3 +267,4 @@ def _bar(pct: float, width: int) -> str:
     """Draw a terminal progress bar."""
     filled = int(pct / 100 * width)
     return "█" * filled + "░" * (width - filled)
+
