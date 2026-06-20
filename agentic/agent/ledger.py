@@ -16,7 +16,7 @@ Design:
   - Pure Python stdlib: sqlite3, hashlib, json, datetime — zero deps.
 
 Usage:
-  >>> from llama.agent.ledger import AuditLedger
+  >>> from agentic.agent.ledger import AuditLedger
   >>> ledger = AuditLedger(db_path="./agent_audit.db")
   >>> ledger.append(
   ...     session_id="run-001",

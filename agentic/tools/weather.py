@@ -6,7 +6,7 @@ Production upgrade: replace with real weather API (OpenWeatherMap, etc.).
 
 from __future__ import annotations
 
-from llama.tools.registry import Tool
+from agentic.tools.registry import Tool
 
 # ── Simulated weather database ───────────────────────────────────────
 

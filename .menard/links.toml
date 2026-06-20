@@ -1,87 +1,143 @@
-# =============================================================================
-# menard links.toml — 代码段 → 文档章节 映射表
-#
-# 格式: "<文件>:<行范围或符号>" = ["<文档>:<章节锚点>", ...]
-#
-# 当指定代码段在 git diff 中发生变化时, menard 会将对应的文档章节标记为"过期",
-# 阻止 commit 直到文档被更新。
-#
-# 行范围格式:
-#   "file:L1-L2" = 第 L1 行到第 L2 行
-#   "file:SYMBOL" = 符号引用 (函数/类/常量名), 由 check_docs.py 解析
-# =============================================================================
+# AgentDev Code-to-Documentation Link Map
+# Section names MUST match exactly what menard detects (case-insensitive).
+# Run `menard info <file>` to see detected sections.
 
-[links]
+# ── Core Agent Loop ──
+[[link]]
+code = "llama/agent/runner.py"
+docs = [
+    "doc/BRD.md#BR-001: ReAct 推理循环",
+    "doc/FSD.md#3.5 ReAct 核心循环  → [BR-001](BRD.md) ReAct推理循环, [BR-006](BRD.md) 日志输出, [NFR-002](BRD.md) 可靠性",
+]
 
-# ── 配置常量 ──
-"ReActDemo:MODEL_PATH"                = ["FSD.md:3.4", "BRD.md:BR-002"]
-"ReActDemo:JETSON_N_CTX"              = ["FSD.md:3.4", "FSD.md:5.1", "BRD.md:BR-002", "BRD.md:NFR-001"]
-"ReActDemo:JETSON_N_GPU_LAYERS"       = ["FSD.md:3.4", "BRD.md:BR-002"]
-"ReActDemo:JETSON_N_THREADS"          = ["FSD.md:3.4", "BRD.md:BR-002"]
-"ReActDemo:MAX_STEPS"                 = ["FSD.md:3.5", "BRD.md:BR-001"]
-"ReActDemo:TEMPERATURE"               = ["FSD.md:3.4", "FSD.md:5.2", "BRD.md:BR-002"]
-"ReActDemo:QWEN_PRICE"                = ["FSD.md:5.3", "BRD.md:BR-007"]
+[[link]]
+code = "llama/agent/budget.py"
+docs = [
+    "doc/BRD.md#BR-007: 人民币成本估算",
+    "doc/FSD.md#5.3 定价参数  → [BR-007](BRD.md) 成本估算",
+]
 
-# ── ProtocolLoader (YAML 协议驱动) ──
-"ReActDemo:45-401"                    = ["FSD.md:3.1", "BRD.md:BR-004"]
-"ReActDemo:45-200"                    = ["BRD.md:BR-004"]   # prompt 渲染部分
-"ReActDemo:220-320"                   = ["BRD.md:BR-004"]   # response 解析部分
-"ReActDemo:330-401"                   = ["BRD.md:BR-006"]   # output 格式化部分
+[[link]]
+code = "llama/agent/ledger.py"
+docs = [
+    "doc/BRD.md#BR-007: 人民币成本估算",
+]
 
-# ── 数据类 ──
-"ReActDemo:437-471"                   = ["FSD.md:3.2"]      # PromptDecomposition
-"ReActDemo:473-511"                   = ["FSD.md:3.2"]      # TurnDiff
-"ReActDemo:514-544"                   = ["FSD.md:3.2"]      # TraceRecord
+# ── LLM Backend ──
+[[link]]
+code = "llama/llm/__init__.py"
+docs = [
+    "doc/BRD.md#BR-002: 本地 GGUF 模型推理",
+    "doc/FSD.md#3.4 LLM 初始化  → [BR-002](BRD.md) 本地GGUF推理",
+    "doc/GLOSSARY.md#GGUF (GPT-Generated Unified Format)",
+]
 
-# ── LlamaTracer (调用链追踪) ──
-"ReActDemo:549-1038"                  = ["FSD.md:3.2", "BRD.md:BR-003"]
-"ReActDemo:595-630"                   = ["FSD.md:3.2"]      # _decompose_prompt
-"ReActDemo:640-720"                   = ["FSD.md:3.2"]      # _compute_diff (Diff 算法)
-"ReActDemo:750-870"                   = ["FSD.md:3.2"]      # record_turn + summary
-"ReActDemo:900-960"                   = ["BRD.md:BR-003"]   # print_summary (Cache 报告)
-"ReActDemo:990-1038"                  = ["BRD.md:BR-005"]   # export_html (HTML 报告)
+# ── Protocol & YAML ──
+[[link]]
+code = "llama/protocol/template.py"
+docs = [
+    "doc/BRD.md#BR-004: YAML 协议驱动",
+    "doc/FSD.md#3.1 ProtocolLoader  → [BR-004](BRD.md) YAML协议驱动",
+]
 
-# ── 工具定义 ──
-"ReActDemo:1041-1065"                 = ["FSD.md:3.3", "BRD.md:BR-001", "BRD.md:NFR-005"]  # calculator
-"ReActDemo:1067-1095"                 = ["FSD.md:3.3", "BRD.md:BR-001"]                     # get_weather
-"ReActDemo:TOOLS"                     = ["FSD.md:3.3", "BRD.md:BR-001"]
+[[link]]
+code = "llama/protocol/format.py"
+docs = [
+    "doc/BRD.md#BR-004: YAML 协议驱动",
+]
 
-# ── LLM 初始化 ──
-"ReActDemo:1101-1156"                 = ["FSD.md:3.4", "BRD.md:BR-002"]
+[[link]]
+code = "llama/ReActProtocol.yaml"
+docs = [
+    "doc/BRD.md#BR-004: YAML 协议驱动",
+    "doc/FSD.md#3.1 ProtocolLoader  → [BR-004](BRD.md) YAML协议驱动",
+]
 
-# ── ReAct 核心循环 ──
-"ReActDemo:1162-1188"                 = ["BRD.md:BR-004"]   # clean_qwen_output
-"ReActDemo:1192-1233"                 = ["BRD.md:BR-004"]   # get_react_prompt
-"ReActDemo:1236-1317"                 = ["BRD.md:BR-004"]   # parse_llm_output
-"ReActDemo:1320-1494"                 = ["FSD.md:3.5", "BRD.md:BR-001", "BRD.md:NFR-002"]  # run_react_agent
-"ReActDemo:1440-1460"                 = ["BRD.md:NFR-002"]  # Error recovery 逻辑
-"ReActDemo:1480-1494"                 = ["BRD.md:NFR-002"]  # max_steps 安全终止
+# ── Tracing & Observability ──
+[[link]]
+code = "llama/tracer/collector.py"
+docs = [
+    "doc/BRD.md#BR-003: 调用链全量追踪",
+    "doc/FSD.md#3.2 LlamaTracer  → [BR-003](BRD.md) 调用链追踪, [BR-005](BRD.md) HTML报告, [BR-007](BRD.md) 成本估算",
+]
 
-# ── YAML 协议模板 ──
-"ReActProtocol.yaml:20-72"            = ["FSD.md:3.1", "BRD.md:BR-004"]   # prompt section
-"ReActProtocol.yaml:73-125"           = ["FSD.md:3.1", "BRD.md:BR-004"]   # response section
-"ReActProtocol.yaml:126-171"          = ["FSD.md:3.1", "BRD.md:BR-006"]   # output section
-"ReActProtocol.yaml:90-100"           = ["FSD.md:4.2"]                    # stop_sequences
-"ReActProtocol.yaml:130-145"          = ["BRD.md:BR-006"]                 # terminal 日志模板
+[[link]]
+code = "llama/tracer/diff.py"
+docs = [
+    "doc/BRD.md#BR-003: 调用链全量追踪",
+]
 
-# ── HTML 渲染器 ──
-"ReActTraceRenderer.py:27-487"        = ["FSD.md:3.6", "BRD.md:BR-005"]   # render_html
-"ReActTraceRenderer.py:60-150"        = ["BRD.md:BR-005"]                  # CSS 设计系统
-"ReActTraceRenderer.py:400-450"       = ["BRD.md:BR-005"]                  # 主题切换 JS
+[[link]]
+code = "llama/ReActTraceRenderer.py"
+docs = [
+    "doc/BRD.md#BR-005: HTML Trace 可视化报告",
+    "doc/FSD.md#3.6 ReActTraceRenderer  → [BR-005](BRD.md) HTML可视化报告",
+]
 
-# ── 文档间交叉引用 (docs referencing docs) ──
-"doc/BRD.md:BR-001"                   = ["doc/FSD.md:3.5"]
-"doc/BRD.md:BR-002"                   = ["doc/FSD.md:3.4"]
-"doc/BRD.md:BR-003"                   = ["doc/FSD.md:3.2"]
-"doc/BRD.md:BR-004"                   = ["doc/FSD.md:3.1"]
-"doc/BRD.md:BR-005"                   = ["doc/FSD.md:3.6"]
-"doc/BRD.md:NFR-001"                  = ["doc/FSD.md:5.1"]
-"doc/BRD.md:NFR-002"                  = ["doc/FSD.md:6"]
+# ── Tools ──
+[[link]]
+code = "llama/tools/registry.py"
+docs = [
+    "doc/FSD.md#3.3 工具定义  → [BR-001](BRD.md) ReAct推理循环, [NFR-005](BRD.md) 安全性",
+]
 
-[settings]
-# 当检测到过期文档时: "warn" (仅警告) | "block" (阻止 commit)
-on_stale = "block"
-# 忽略未追踪的文件变更
-ignore_untracked = true
-# 检测粒度: "file" | "section"
-granularity = "section"
+[[link]]
+code = "llama/tools/calculator.py"
+docs = [
+    "doc/FSD.md#3.3 工具定义  → [BR-001](BRD.md) ReAct推理循环, [NFR-005](BRD.md) 安全性",
+]
+
+[[link]]
+code = "llama/tools/weather.py"
+docs = [
+    "doc/FSD.md#3.3 工具定义  → [BR-001](BRD.md) ReAct推理循环, [NFR-005](BRD.md) 安全性",
+]
+
+[[link]]
+code = "llama/tools/sandbox.py"
+docs = [
+    "doc/BRD.md#NFR-005: 安全性",
+    "doc/FSD.md#3.3 工具定义  → [BR-001](BRD.md) ReAct推理循环, [NFR-005](BRD.md) 安全性",
+]
+
+# ── Security ──
+[[link]]
+code = "llama/guard/observation_sanitizer.py"
+docs = [
+    "doc/BRD.md#NFR-005: 安全性",
+]
+
+# ── Config & Error Handling ──
+[[link]]
+code = "llama/config.py"
+docs = [
+    "doc/FSD.md#5. 配置参数",
+]
+
+[[link]]
+code = "llama/exceptions.py"
+docs = [
+    "doc/FSD.md#6. 错误处理矩阵",
+    "doc/BRD.md#NFR-002: 可靠性",
+]
+
+# ── Logging ──
+[[link]]
+code = "llama/logging_config.py"
+docs = [
+    "doc/BRD.md#BR-006: 工业级日志输出",
+]
+
+# ── Response Parsing ──
+[[link]]
+code = "llama/response_parser.py"
+docs = [
+    "doc/BRD.md#BR-001: ReAct 推理循环",
+]
+
+# ── Package root ──
+[[link]]
+code = "llama/__init__.py"
+docs = [
+    "doc/FSD.md#2. 系统架构",
+]

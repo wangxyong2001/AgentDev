@@ -4,7 +4,7 @@ Prompt Template Renderer — assembles ReAct prompts from YAML protocol.
 Handles Section 1 of the ReAct protocol: Agent → LLM prompt construction.
 
 Usage:
-  >>> from llama.protocol.template import PromptTemplate
+  >>> from agentic.protocol.template import PromptTemplate
   >>> tpl = PromptTemplate(yaml_path="ReActProtocol.yaml")  # YAML-driven
   >>> tpl = PromptTemplate()                                 # Built-in defaults
   >>> prompt = tpl.render_full_prompt(tool_names, question, history)
@@ -16,7 +16,7 @@ import os
 from typing import List, Dict, Optional, Any
 from dataclasses import dataclass, field, fields, MISSING
 
-from llama.logging_config import get_logger
+from agentic.logging_config import get_logger
 
 logger = get_logger(__name__)
 

@@ -15,7 +15,7 @@ import logging
 import io
 import pytest
 
-from llama.logging_config import (
+from agentic.logging_config import (
     HumanFormatter,
     JSONFormatter,
     TagAdapter,

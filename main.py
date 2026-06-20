@@ -18,17 +18,17 @@ _PARENT = os.path.dirname(os.path.abspath(__file__))
 if _PARENT not in sys.path:
     sys.path.insert(0, _PARENT)
 
-from llama.config import get_config
-from llama.logging_config import setup_logging, get_logger
-from llama.exceptions import FatalError, ModelLoadError
-from llama.response_parser import ResponseParser
-from llama.protocol.template import PromptTemplate
-from llama.protocol.format import OutputFormatter
-from llama.tools import ToolRegistry, calculator_tool, weather_tool
-from llama.llm import create_llm
-from llama.agent import AgentCore, TokenBudget, CircuitBreaker, AuditLedger
-from llama.tracer.collector import TraceCollector
-from llama.guard.observation_sanitizer import ObservationSanitizer
+from agentic.config import get_config
+from agentic.logging_config import setup_logging, get_logger
+from agentic.exceptions import FatalError, ModelLoadError
+from agentic.response_parser import ResponseParser
+from agentic.protocol.template import PromptTemplate
+from agentic.protocol.format import OutputFormatter
+from agentic.tools import ToolRegistry, calculator_tool, weather_tool
+from agentic.llm import create_llm
+from agentic.agent import AgentCore, TokenBudget, CircuitBreaker, AuditLedger
+from agentic.tracer.collector import TraceCollector
+from agentic.guard.observation_sanitizer import ObservationSanitizer
 
 # ── Bootstrap ──────────────────────────────────────────────────────
 config = get_config()

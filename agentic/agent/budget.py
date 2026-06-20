@@ -14,7 +14,7 @@ CircuitBreaker:
   immediately.
 
 Usage:
-  >>> from llama.agent.budget import TokenBudget, CircuitBreaker, CircuitBreakerError
+  >>> from agentic.agent.budget import TokenBudget, CircuitBreaker, CircuitBreakerError
   >>> budget = TokenBudget(max_tokens=4096, warning_ratio=0.8)
   >>> breaker = CircuitBreaker(max_turns=10, token_budget=budget)
   >>> try:

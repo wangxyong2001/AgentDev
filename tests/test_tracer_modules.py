@@ -3,13 +3,13 @@ Tests for llama.tracer — diff algorithm and collector.
 """
 
 import pytest
-from llama.tracer.diff import (
+from agentic.tracer.diff import (
     PromptDecomposition,
     TurnDiff,
     decompose_prompt,
     compute_diff,
 )
-from llama.tracer.collector import TraceCollector, TraceRecord
+from agentic.tracer.collector import TraceCollector, TraceRecord
 
 
 # ==========================================================================

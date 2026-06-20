@@ -13,7 +13,7 @@ Covers:
 
 import pytest
 
-from llama.exceptions import (
+from agentic.exceptions import (
     ReActError,
     RecoverableError,
     ParseError,

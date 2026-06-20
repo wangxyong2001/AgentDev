@@ -13,9 +13,9 @@ Phase 3 (future):
   grounding.py   — Conclusion verification against tool outputs
 """
 
-from llama.agent.runner import AgentCore
-from llama.agent.budget import TokenBudget, CircuitBreaker, CircuitBreakerError
-from llama.agent.ledger import AuditLedger
+from agentic.agent.runner import AgentCore
+from agentic.agent.budget import TokenBudget, CircuitBreaker, CircuitBreakerError
+from agentic.agent.ledger import AuditLedger
 
 __all__ = [
     "AgentCore",

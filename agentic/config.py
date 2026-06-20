@@ -8,7 +8,7 @@ Design principles:
   4. Validation on load — fail fast on misconfiguration
 
 Usage:
-  >>> from llama.config import ReActConfig
+  >>> from agentic.config import ReActConfig
   >>> cfg = ReActConfig.from_env()
   >>> llm = Llama(model_path=cfg.model_path, n_ctx=cfg.n_ctx, ...)
 
@@ -197,7 +197,7 @@ def get_config() -> ReActConfig:
       ReActConfig instance, or None if initialization failed.
 
     Usage:
-      >>> from llama.config import get_config
+      >>> from agentic.config import get_config
       >>> cfg = get_config()
       >>> llm = Llama(model_path=cfg.model_path, n_ctx=cfg.n_ctx)
     """

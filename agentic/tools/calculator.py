@@ -7,8 +7,8 @@ RLIMIT_AS, RLIMIT_CPU, RLIMIT_NPROC and per-invocation temp filesystem.
 
 from __future__ import annotations
 
-from llama.tools.registry import Tool
-from llama.tools.sandbox import execute_in_sandbox
+from agentic.tools.registry import Tool
+from agentic.tools.sandbox import execute_in_sandbox
 
 
 def _calculate(expression: str) -> str:

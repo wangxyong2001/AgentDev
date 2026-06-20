@@ -8,9 +8,9 @@ Replaces the global TOOLS list with a registry pattern. Supports:
   - Tool metadata (description, validation schema placeholder)
 
 Usage:
-  >>> from llama.tools.registry import ToolRegistry
-  >>> from llama.tools.calculator import calculator_tool
-  >>> from llama.tools.weather import weather_tool
+  >>> from agentic.tools.registry import ToolRegistry
+  >>> from agentic.tools.calculator import calculator_tool
+  >>> from agentic.tools.weather import weather_tool
   >>> registry = ToolRegistry()
   >>> registry.register(calculator_tool)
   >>> registry.register(weather_tool)
@@ -23,8 +23,8 @@ from __future__ import annotations
 from typing import Dict, List, Optional, Callable, Any
 from dataclasses import dataclass, field
 
-from llama.exceptions import ToolNotFoundError, ToolExecutionError
-from llama.logging_config import get_logger
+from agentic.exceptions import ToolNotFoundError, ToolExecutionError
+from agentic.logging_config import get_logger
 
 logger = get_logger(__name__)
 

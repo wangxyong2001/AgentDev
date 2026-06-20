@@ -8,7 +8,7 @@ Splits the monolithic ProtocolLoader into two concerns:
 Parsing is delegated to llama.response_parser.ResponseParser (unified).
 """
 
-from llama.protocol.template import PromptTemplate
-from llama.protocol.format import OutputFormatter
+from agentic.protocol.template import PromptTemplate
+from agentic.protocol.format import OutputFormatter
 
 __all__ = ["PromptTemplate", "OutputFormatter"]

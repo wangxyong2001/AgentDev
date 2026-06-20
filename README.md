@@ -36,7 +36,7 @@ This project is the engineering output of a systematic industry research effort 
 ## Architecture
 
 ```
-llama/
+agentic/
 ├── config.py              # 12-Factor config (frozen dataclass + env vars)
 ├── exceptions.py          # Exception hierarchy (Recoverable vs Fatal)
 ├── logging_config.py      # Structured logging (10 tags + JSON/human dual format)

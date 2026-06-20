@@ -9,8 +9,8 @@ The diff algorithm is stateless and independently testable.
 The collector manages session state and exports.
 """
 
-from llama.tracer.diff import PromptDecomposition, TurnDiff
-from llama.tracer.collector import TraceCollector, TraceRecord
+from agentic.tracer.diff import PromptDecomposition, TurnDiff
+from agentic.tracer.collector import TraceCollector, TraceRecord
 
 __all__ = [
     "PromptDecomposition",

@@ -8,7 +8,7 @@ Manages:
   - HTML report export (delegates to ReActTraceRenderer)
 
 Usage:
-  >>> from llama.tracer.collector import TraceCollector
+  >>> from agentic.tracer.collector import TraceCollector
   >>> collector = TraceCollector(model_name="qwen3.6-35b", pricing=(0.004, 0.012))
   >>> collector.record_turn(turn=1, question="2+2?", prompt=..., ...)
   >>> collector.summary()  # {"total_turns": 1, "total_tokens": 222, ...}
@@ -21,13 +21,13 @@ from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Dict, Any, List, Optional, Tuple
 
-from llama.tracer.diff import (
+from agentic.tracer.diff import (
     PromptDecomposition,
     TurnDiff,
     decompose_prompt,
     compute_diff,
 )
-from llama.logging_config import get_logger
+from agentic.logging_config import get_logger
 
 logger = get_logger(__name__)
 

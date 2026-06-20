@@ -7,8 +7,8 @@ Decouples Agent core loop from the LLM implementation. Supports:
   - Ollama local server (future)
 
 Usage:
-  >>> from llama.llm import create_llm, LLMBackend, LLMResponse
-  >>> from llama.config import get_config
+  >>> from agentic.llm import create_llm, LLMBackend, LLMResponse
+  >>> from agentic.config import get_config
   >>> llm = create_llm(get_config())
   >>> response = llm.generate("What is 2+2?", stop=["Observation:"], max_tokens=512, temperature=0.2)
 """
@@ -21,8 +21,8 @@ import time
 from typing import List, Protocol, Dict, Any, Optional
 from dataclasses import dataclass
 
-from llama.exceptions import ModelLoadError
-from llama.logging_config import get_logger
+from agentic.exceptions import ModelLoadError
+from agentic.logging_config import get_logger
 
 logger = get_logger(__name__)
 

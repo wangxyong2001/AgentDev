@@ -7,7 +7,7 @@ Design principles:
   3. Integration with structured logging (exceptions serialize to JSON)
 
 Usage:
-  >>> from llama.exceptions import ParseError, ToolNotFoundError, FatalError
+  >>> from agentic.exceptions import ParseError, ToolNotFoundError, FatalError
   >>> try:
   ...     parsed = parser.parse(output)
   ... except ParseError as e:

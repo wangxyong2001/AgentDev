@@ -8,7 +8,7 @@ Exports:
   weather_tool    — Weather lookup (simulated)
 
 Usage:
-  >>> from llama.tools import ToolRegistry, calculator_tool, weather_tool
+  >>> from agentic.tools import ToolRegistry, calculator_tool, weather_tool
   >>> registry = ToolRegistry()
   >>> registry.register(calculator_tool)
   >>> registry.register(weather_tool)
@@ -16,8 +16,8 @@ Usage:
   "4"
 """
 
-from llama.tools.registry import Tool, ToolRegistry
-from llama.tools.calculator import calculator_tool
-from llama.tools.weather import weather_tool
+from agentic.tools.registry import Tool, ToolRegistry
+from agentic.tools.calculator import calculator_tool
+from agentic.tools.weather import weather_tool
 
 __all__ = ["Tool", "ToolRegistry", "calculator_tool", "weather_tool"]

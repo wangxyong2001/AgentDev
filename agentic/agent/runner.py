@@ -12,7 +12,7 @@ Error recovery: PARSE failure → ERROR_RECOVERY → PROMPT_BUILD
 Termination:    FINAL_ANSWER | MAX_STEPS
 
 Usage:
-  >>> from llama.agent import AgentCore
+  >>> from agentic.agent import AgentCore
   >>> agent = AgentCore(llm=backend, registry=tools, template=prompt_tpl, parser=parser)
   >>> result = agent.run("What is 2+2?")
   "4"
@@ -23,8 +23,8 @@ from __future__ import annotations
 import time
 from typing import List, Dict, Optional, Protocol
 
-from llama.exceptions import ParseError, ToolNotFoundError, ToolExecutionError
-from llama.logging_config import get_logger
+from agentic.exceptions import ParseError, ToolNotFoundError, ToolExecutionError
+from agentic.logging_config import get_logger
 
 logger = get_logger(__name__)
 

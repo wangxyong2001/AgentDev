@@ -6,8 +6,8 @@ ReAct Agent — Enterprise Edition (v3.0).
 Refactored from monolithic script into modular architecture.
 
 Usage:
-  cd /path/to/AgentDev && python llama/ReActDemo
-  # or: PYTHONPATH=/path/to/AgentDev python /path/to/AgentDev/llama/ReActDemo
+  cd /path/to/AgentDev && python agentic/ReActDemo
+  # or: PYTHONPATH=/path/to/AgentDev python /path/to/AgentDev/agentic/ReActDemo
 """
 
 import os
@@ -430,7 +430,7 @@ class ProtocolLoader:
 # ==========================================
 # 1. 配置 — 12-Factor App (环境变量驱动)
 # ==========================================
-# 所有配置项现在通过环境变量 REACT_* 控制，详见 llama/config.py
+# 所有配置项现在通过环境变量 REACT_* 控制，详见 agentic/config.py
 # 覆盖默认值:  export REACT_MODEL_PATH=/path/to/model.gguf
 # 切换日志格式: export REACT_LOG_FORMAT=json
 #

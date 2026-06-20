@@ -13,8 +13,8 @@ Covers all 7 parse paths:
 import pytest
 from unittest.mock import patch, mock_open
 
-from llama.response_parser import ResponseParser, ParserConfig
-from llama.exceptions import ParseError
+from agentic.response_parser import ResponseParser, ParserConfig
+from agentic.exceptions import ParseError
 
 
 # ==========================================================================

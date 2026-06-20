@@ -4,7 +4,7 @@ Output Formatter — YAML-driven terminal log and error message formatting.
 Handles Section 3 of the ReAct protocol: Agent → User output formatting.
 
 Usage:
-  >>> from llama.protocol.format import OutputFormatter
+  >>> from agentic.protocol.format import OutputFormatter
   >>> fmt = OutputFormatter(yaml_path="ReActProtocol.yaml")
   >>> fmt.format("agent_start")         # "[AGENT] === ReAct loop start ==="
   >>> fmt.format("step_header", step=3) # "[STEP 3] ---"
@@ -15,7 +15,7 @@ from __future__ import annotations
 import os
 from typing import Optional, Dict, Any
 
-from llama.logging_config import get_logger
+from agentic.logging_config import get_logger
 
 logger = get_logger(__name__)
 

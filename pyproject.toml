@@ -20,6 +20,12 @@ dev = [
 line-length = 120
 target-version = "py311"
 
+[tool.menard]
+mode = "block"
+transitive_depth = 1
+doc_paths = ["doc/**/*.md", "README.md"]
+require_links = ["llama/**/*.py", "llama/**/*.yaml"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = "test_*.py"

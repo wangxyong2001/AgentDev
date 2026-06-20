@@ -13,7 +13,7 @@ Architecture:
   └── validate()    — post-parse validation (action known, input safe)
 
 Usage:
-  >>> from llama.response_parser import ResponseParser
+  >>> from agentic.response_parser import ResponseParser
   >>> parser = ResponseParser(yaml_path="ReActProtocol.yaml")  # YAML-driven
   >>> parser = ResponseParser()                                 # Built-in defaults
   >>> result = parser.parse(llm_output, tool_names=["calculator", "get_weather"])
@@ -26,7 +26,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-from llama.exceptions import ParseError, ToolNotFoundError
+from agentic.exceptions import ParseError, ToolNotFoundError
 
 
 # ==========================================================================

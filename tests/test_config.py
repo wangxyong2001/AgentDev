@@ -13,7 +13,7 @@ import os
 import pytest
 from pathlib import Path
 
-from llama.config import ReActConfig, get_config
+from agentic.config import ReActConfig, get_config
 
 
 # ==========================================================================

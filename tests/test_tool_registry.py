@@ -3,10 +3,10 @@ Tests for llama.tools — ToolRegistry, calculator, weather.
 """
 
 import pytest
-from llama.tools.registry import Tool, ToolRegistry
-from llama.tools.calculator import calculator_tool, _calculate
-from llama.tools.weather import weather_tool, _get_weather
-from llama.exceptions import ToolNotFoundError, ToolExecutionError
+from agentic.tools.registry import Tool, ToolRegistry
+from agentic.tools.calculator import calculator_tool, _calculate
+from agentic.tools.weather import weather_tool, _get_weather
+from agentic.exceptions import ToolNotFoundError, ToolExecutionError
 
 
 class TestToolRegistry:
