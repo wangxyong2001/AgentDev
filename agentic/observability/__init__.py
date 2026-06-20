@@ -202,7 +202,7 @@ def setup_logging(level: str = "INFO", log_format: str = "human",
                  如果为 None，仅输出到 stdout。
 
     处理逻辑:
-      1. 获取名为 "llama" 的根日志记录器
+      1. 获取名为 "agentic" 的根日志记录器
       2. 设置日志级别
       3. 清除已有 handler 确保幂等性
       4. 添加 stdout handler

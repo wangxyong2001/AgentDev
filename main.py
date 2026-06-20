@@ -13,6 +13,7 @@ ReAct Agent v3.0 — 企业版入口点。
 
 import os
 import sys
+from datetime import datetime
 
 # 确保 AgentDev/ 在 sys.path 中
 _PARENT = os.path.dirname(os.path.abspath(__file__))
@@ -86,13 +87,14 @@ def main():
         parser=parser,
         collector=tracer,
         formatter=OutputFormatter(yaml_path if os.path.exists(yaml_path) else None),
+        ledger=ledger,
         max_steps=config.max_steps,
+        session_id=f"run-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
     )
 
     # ── 第 7 步: 运行 ────────────────────────────────────────
     test_questions = [
         "123 乘以 45 等于多少？",
-        "伦敦的天气乘以 2 是多少？",
         "告诉我上海的天气，然后加上 10。",
     ]
 

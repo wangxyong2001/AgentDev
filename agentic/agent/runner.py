@@ -25,6 +25,7 @@ AgentCore — 状态机构建的 ReAct 推理循环。
 from __future__ import annotations
 
 import time
+from datetime import datetime
 from typing import List, Dict, Optional, Protocol
 
 from agentic.exceptions import ParseError, ToolNotFoundError, ToolExecutionError
@@ -66,7 +67,9 @@ class AgentCore:
         parser,                 # ResponseParser
         collector=None,         # TraceCollector（可选）
         formatter=None,         # OutputFormatter（可选）
+        ledger=None,            # AuditLedger（可选，审计事件记录）
         max_steps: int = 8,
+        session_id: str = "",
     ):
         """
         初始化 AgentCore 实例，注入所有依赖组件。
@@ -86,7 +89,9 @@ class AgentCore:
         self._parser = parser
         self._collector = collector
         self._formatter = formatter
+        self._ledger = ledger
         self.max_steps = max_steps
+        self._session_id = session_id or f"run-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
     # ── 公共 API ───────────────────────────────────────────────────
 
@@ -152,6 +157,15 @@ class AgentCore:
 
             logger.info(f"LLM: {response.prompt_tokens}p+{response.completion_tokens}c tokens, {response.duration_ms:.0f}ms")
             logger.debug(f"Raw: {response.text[:200]}")
+            if self._ledger:
+                self._ledger.append(
+                    session_id=self._session_id, span_id=f"step-{step}-llm",
+                    event_type="llm_call", actor="agent",
+                    resource=f"llm:{getattr(self._llm, 'model_name', 'unknown')}",
+                    input_text=prompt[-500:], output_text=response.text[:500],
+                    decision="in_progress", token_delta=response.prompt_tokens + response.completion_tokens,
+                    duration_ms=int(response.duration_ms),
+                )
 
             # ── 状态：PARSE ─────────────────────────────────────────
             # 从非结构化的 LLM 输出中提取结构化字段
@@ -265,6 +279,15 @@ class AgentCore:
                 tool_error = True
 
             logger.info(f"  Observation: {observation}")
+            if self._ledger:
+                self._ledger.append(
+                    session_id=self._session_id, span_id=f"step-{step}-tool",
+                    event_type="tool_exec", actor="agent",
+                    resource=f"tool:{action}",
+                    input_text=action_input, output_text=observation[:500],
+                    decision="tool_error" if tool_error else "next_turn",
+                    compliance_tags=["SOC2_CC7.2"] if not tool_error else ["SOC2_CC7.2", "error"],
+                )
 
             # ── 记录跟踪（如果配置了 collector）───────────────────
             if self._collector:

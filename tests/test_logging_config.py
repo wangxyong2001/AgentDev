@@ -39,7 +39,7 @@ class TestSetupLogging:
         预期结果：创建 1 个 handler，logger 级别设置为 DEBUG
         成功条件：len(logger.handlers) == 1 且 logger.level == logging.DEBUG
         """
-        logger = logging.getLogger("llama")
+        logger = logging.getLogger("agentic")
         logger.handlers.clear()
         setup_logging(level="DEBUG", log_format="human")
         assert len(logger.handlers) == 1
@@ -55,7 +55,7 @@ class TestSetupLogging:
         """
         setup_logging(level="INFO", log_format="human")
         setup_logging(level="INFO", log_format="human")
-        logger = logging.getLogger("llama")
+        logger = logging.getLogger("agentic")
         assert len(logger.handlers) == 1
 
     def test_get_logger_returns_tag_adapter(self):
