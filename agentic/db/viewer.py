@@ -70,6 +70,7 @@ def cmd_last(db_path: str, n: int):
 def cmd_stats(db_path: str):
     """显示统计摘要。"""
     conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
     rows = conn.execute("""
         SELECT
             COUNT(*) AS total,
