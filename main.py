@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-ReAct Agent v3.0 — Enterprise Edition Entry Point.
+ReAct Agent v3.0 — 企业版入口点。
 
-Wires together all enterprise modules:
+功能描述:
+  组装所有企业级模块:
   config → logging → sandbox → parser → template → tools → LLM → agent → tracer → ledger
 
-Usage:
+用法:
   cd /path/to/AgentDev && python main.py
   REACT_MODEL_PATH=/path/to/model.gguf python main.py
 """
@@ -13,7 +14,7 @@ Usage:
 import os
 import sys
 
-# Ensure AgentDev/ is on sys.path
+# 确保 AgentDev/ 在 sys.path 中
 _PARENT = os.path.dirname(os.path.abspath(__file__))
 if _PARENT not in sys.path:
     sys.path.insert(0, _PARENT)
@@ -30,54 +31,54 @@ from agentic.agent import AgentCore, TokenBudget, CircuitBreaker, AuditLedger
 from agentic.tracer.collector import TraceCollector
 from agentic.guard.observation_sanitizer import ObservationSanitizer
 
-# ── Bootstrap ──────────────────────────────────────────────────────
+# ── 引导 ──────────────────────────────────────────────────────
 config = get_config()
 if config is None:
-    print("[FATAL] Configuration failed. Check REACT_MODEL_PATH.", file=sys.stderr)
+    print("[致命错误] 配置失败。请检查 REACT_MODEL_PATH。", file=sys.stderr)
     sys.exit(1)
 
 setup_logging(level=config.log_level, log_format=config.log_format,
-              log_file=os.path.join(os.path.dirname(__file__), "agentic", "db", "agent.log"))
+              log_file=os.path.join(os.path.dirname(__file__), "agentic", "log", "agent.log"))
 logger = get_logger(__name__)
 
-logger.init(f"ReAct Agent v3.0 — Enterprise Edition")
-logger.init(f"Model={os.path.basename(config.model_path)}  ctx={config.n_ctx}  "
-            f"format={config.chat_format}  log={config.log_level}/{config.log_format}")
+logger.init(f"ReAct Agent v3.0 — 企业版")
+logger.init(f"模型={os.path.basename(config.model_path)}  context大小={config.n_ctx}  "
+            f"格式={config.chat_format}  日志={config.log_level}/{config.log_format}")
 
 
 def main():
-    # ── Step 1: LLM Backend ────────────────────────────────────────
+    # ── 第 1 步: LLM 后端 ────────────────────────────────────────
     try:
         llm = create_llm(config)
     except (FatalError, ModelLoadError) as e:
-        logger.fatal(f"LLM init failed: {e}")
+        logger.fatal(f"LLM 初始化失败: {e}")
         sys.exit(1)
 
-    # ── Step 2: Tool Registry ──────────────────────────────────────
+    # ── 第 2 步: 工具注册 ──────────────────────────────────────
     registry = ToolRegistry()
     registry.register(calculator_tool)
     registry.register(weather_tool)
-    logger.init(f"Tools registered: {registry.list_names()}")
+    logger.init(f"已注册工具: {registry.list_names()}")
 
-    # ── Step 3: Prompt Template + Parser + Sanitizer ────────────────
+    # ── 第 3 步: 提示词模板 + 解析器 + 清理器 ────────────────
     yaml_path = os.path.join(os.path.dirname(__file__), "agentic", "protocol", "ReActProtocol.yaml")
     template = PromptTemplate(yaml_path if os.path.exists(yaml_path) else None)
     parser = ResponseParser(yaml_path if os.path.exists(yaml_path) else None)
     sanitizer = ObservationSanitizer()
 
-    # ── Step 4: Token Budget + Circuit Breaker ──────────────────────
+    # ── 第 4 步: Token 预算 + 熔断器 ──────────────────────
     budget = TokenBudget(max_tokens=config.n_ctx)
     breaker = CircuitBreaker(max_turns=config.max_steps, token_budget=budget)
 
-    # ── Step 5: Trace Collector + Audit Ledger ──────────────────────
+    # ── 第 5 步: Trace 收集器 + 审计账本 ──────────────────────
     tracer = TraceCollector(
         model_name=llm.model_name,
         pricing=config.price_for("qwen3.6-35b"),
     )
-    ledger = AuditLedger()  # auto: agentic/db/agent_audit.db
-    logger.init(f"Audit ledger: {ledger._db_path}")
+    ledger = AuditLedger()  # 自动: agentic/db/agent_audit.db
+    logger.init(f"审计账本: {ledger._db_path}")
 
-    # ── Step 6: AgentCore ──────────────────────────────────────────
+    # ── 第 6 步: AgentCore ──────────────────────────────────────────
     agent = AgentCore(
         llm=llm,
         registry=registry,
@@ -88,39 +89,39 @@ def main():
         max_steps=config.max_steps,
     )
 
-    # ── Step 7: Run ────────────────────────────────────────────────
+    # ── 第 7 步: 运行 ────────────────────────────────────────
     test_questions = [
-        "What is 123 multiplied by 45?",
-        "What is the weather in London multiplied by 2?",
-        "Tell me the weather in Shanghai and then add 10 to it.",
+        "123 乘以 45 等于多少？",
+        "伦敦的天气乘以 2 是多少？",
+        "告诉我上海的天气，然后加上 10。",
     ]
 
     with ledger:
         for q in test_questions:
-            logger.agent(f"Question: {q}")
+            logger.agent(f"问题: {q}")
             try:
-                # ── Pre-flight breaker check ──
+                # ── 执行前的熔断检查 ──
                 breaker.check_before_call(q)
             except Exception as e:
-                logger.warn(f"Circuit breaker: {e}")
+                logger.warn(f"熔断器: {e}")
                 break
 
             result = agent.run(q)
 
-            # ── Sanitize result before logging/storing ──
+            # ── 在记录/存储之前清理结果 ──
             safe_result = sanitizer.sanitize(result)
             logger.result(safe_result)
 
-    # ── Step 8: Report ─────────────────────────────────────────────
+    # ── 第 8 步: 报告 ─────────────────────────────────────────────
     tracer.print_summary()
 
-    # Verify audit chain integrity
+    # 验证审计链完整性
     chain_ok = ledger.verify_chain()
-    logger.info(f"Audit chain integrity: {'OK' if chain_ok else 'CORRUPTED'}")
+    logger.info(f"审计链完整性: {'OK' if chain_ok else '已损坏'}")
 
     html_path = os.path.join(config.trace_output_dir, "ReActTrace.html")
     tracer.export_html(html_path)
-    logger.info(f"Trace report: {html_path}")
+    logger.info(f"Trace 报告: {html_path}")
 
 
 if __name__ == "__main__":

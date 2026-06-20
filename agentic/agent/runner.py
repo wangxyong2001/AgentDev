@@ -1,25 +1,21 @@
 """
-AgentCore — ReAct reasoning loop as a state machine.
+AgentCore — 状态机构建的 ReAct 推理循环。
 
-Replaces the 170-line monolithic run_react_agent() with a class-based
-state machine that's independently testable. Each iteration follows
-a strict state flow with explicit error recovery for parse failures
-and tool-not-found errors.
+取代 170 行单体函数 run_react_agent()，采用基于类的状态机实现，便于独立测试。
+每次迭代遵循严格的状态流转，对解析失败和工具未找到错误提供显式恢复机制。
 
-States (9, including recovery):
+状态（9 个，含恢复态）：
   IDLE → PROMPT_BUILD → LLM_CALL → PARSE → DISPATCH →
     FINAL_ANSWER | TOOL_EXEC → HISTORY_APPEND → NEXT_ITERATION
-  PARSE failure → ERROR_RECOVERY → PROMPT_BUILD (retry)
-  Termination:    FINAL_ANSWER | MAX_STEPS
+  PARSE 失败 → ERROR_RECOVERY → PROMPT_BUILD（重试）
+  终止状态：    FINAL_ANSWER | MAX_STEPS
 
-Security boundary:
-  The agent treats LLM output as untrusted data. Observations from
-  tool execution are appended to the prompt history as text strings
-  — they are NOT deserialized, evaluated, or executed as code. This
-  prevents prompt-injection attacks that attempt to escape the ReAct
-  loop through crafted tool output.
+安全边界：
+  Agent 将 LLM 输出视为不可信数据。工具执行的观测结果以文本字符串形式
+  追加到提示历史中——不会反序列化、评估或作为代码执行。这可以防止通过
+  精心构造的工具输出逃离 ReAct 循环的提示注入攻击。
 
-Usage:
+用法：
   >>> from agentic.agent import AgentCore
   >>> agent = AgentCore(llm=backend, registry=tools, template=prompt_tpl, parser=parser)
   >>> result = agent.run("What is 2+2?")
@@ -43,22 +39,20 @@ logger = get_logger(__name__)
 
 class AgentCore:
     """
-    ReAct Agent state machine.
+    ReAct Agent 状态机。
 
-    Orchestrates: prompt -> LLM -> parse -> dispatch -> history
-    With error recovery for parse failures and missing tools.
+    编排流程：prompt -> LLM -> 解析 -> 分发 -> 历史记录
+    具备解析失败和工具缺失时的错误恢复能力。
 
-    Dependencies are injected — no global state. This makes the
-    component testable in isolation by swapping real LLM backends
-    with test doubles that implement the ``LLMBackend`` protocol.
+    依赖通过注入方式提供——不依赖全局状态。这使得组件可以通过将真实 LLM
+    后端替换为实现了 ``LLMBackend`` 协议的测试替身进行独立测试。
 
-    Security: All LLM-generated text is treated as untrusted. The
-    parser extracts structured fields from raw text, but does not
-    ``eval()``, ``exec()``, or otherwise interpret the output beyond
-    string matching. Tool output is appended to the prompt context
-    as plain text strings — never deserialized or executed.
+    安全性：所有 LLM 生成的文本均被视为不可信数据。解析器从原始文本中
+    提取结构化字段，但不执行 ``eval()``、``exec()`` 或任何超出字符串匹配
+    范围的输出解释操作。工具输出以纯文本字符串的形式追加到提示上下文
+    中——永不反序列化或执行。
 
-    Usage:
+    用法：
         agent = AgentCore(llm=backend, registry=tools,
                           template=prompt_tpl, parser=parser)
         result = agent.run("What is 2+2?")
@@ -66,33 +60,25 @@ class AgentCore:
 
     def __init__(
         self,
-        llm,                    # LLMBackend (Protocol)
+        llm,                    # LLMBackend（协议接口）
         registry,               # ToolRegistry
         template,               # PromptTemplate
         parser,                 # ResponseParser
-        collector=None,         # TraceCollector (optional)
-        formatter=None,         # OutputFormatter (optional)
+        collector=None,         # TraceCollector（可选）
+        formatter=None,         # OutputFormatter（可选）
         max_steps: int = 8,
     ):
         """
-        Args:
-            llm: An object implementing the ``LLMBackend`` protocol
-                (``generate()`` method + ``model_name`` property).
-            registry: ``ToolRegistry`` instance providing tool name
-                lookup and execution via ``execute()``.
-            template: ``PromptTemplate`` used to render prompts and
-                history entries. Defines stop sequences and token
-                limits for the LLM call.
-            parser: ``ResponseParser`` that extracts ``thought``,
-                ``action``, and ``action_input`` from raw LLM output.
-            collector: Optional ``TraceCollector`` for observability.
-                When provided, each step's full trace (tokens, timing,
-                errors) is recorded.
-            formatter: Optional ``OutputFormatter`` for final answer
-                formatting before returning.
-            max_steps: Maximum ReAct iterations before forced
-                termination. Default 8. Prevents infinite loops from
-                uncooperative LLM output.
+        初始化 AgentCore 实例，注入所有依赖组件。
+
+        参数:
+          llm: 实现了 ``LLMBackend`` 协议的对象（包含 ``generate()`` 方法和 ``model_name`` 属性）。
+          registry: ``ToolRegistry`` 实例，通过 ``execute()`` 提供工具名称查找和执行功能。
+          template: ``PromptTemplate`` 实例，用于渲染提示词和历史条目。定义 LLM 调用的停止序列和 token 限制。
+          parser: ``ResponseParser`` 实例，从 LLM 原始输出中提取 ``thought``、``action`` 和 ``action_input``。
+          collector: 可选 ``TraceCollector`` 实例，用于可观测性。设置后记录每一步的完整跟踪信息（token 数、耗时、错误）。
+          formatter: 可选 ``OutputFormatter`` 实例，用于返回前对最终答案进行格式化。
+          max_steps: 强制终止前的最大 ReAct 迭代次数。默认 8。防止因 LLM 不配合输出导致无限循环。
         """
         self._llm = llm
         self._registry = registry
@@ -102,28 +88,37 @@ class AgentCore:
         self._formatter = formatter
         self.max_steps = max_steps
 
-    # ── Public API ───────────────────────────────────────────────────
+    # ── 公共 API ───────────────────────────────────────────────────
 
     def run(self, question: str) -> str:
         """
-        Execute a complete ReAct reasoning loop.
+        执行完整的 ReAct 推理循环。
 
-        The method iterates through a state machine: prompt building,
-        LLM generation, response parsing, action dispatch (tool call
-        or final answer), history appending, and loop continuation.
-        On parse failure, the error is recorded in history and the
-        loop retries rather than crashing.
+        该方法通过状态机迭代：构建提示词、LLM 生成、响应解析、动作分发
+        （工具调用或最终答案）、历史追加和循环继续。解析失败时将错误记录
+        到历史中并重试，而不是崩溃退出。
 
-        Args:
-          question: Natural language question to answer.
+        参数:
+          question: 用户自然语言问题字符串。
 
-        Returns:
-          Final answer string, or "Agent stopped due to max steps."
+        处理逻辑:
+          1. 组装工具描述、用户问题、历史记录构建提示词
+          2. 调用 LLM 生成 Thought/Action/Action Input
+          3. 正则解析 LLM 输出，提取结构化字段
+          4. 根据 Action 类型分发：final_answer 终止 / 工具名调用执行
+          5. 工具执行结果作为 Observation 追加到历史
+          6. 循环直到 Final Answer 或达到 max_steps 上限
 
-        Raises:
-          Only fatal errors — recoverable errors (parse failures,
-          tool not found, tool execution errors) are handled inside
-          the loop without propagating exceptions.
+        错误恢复:
+          - 解析失败 → 将原始输出作为 Observation 注入，提示模型重试
+          - 工具不存在 → 返回可用工具列表作为 Observation
+          - 工具执行异常 → 返回错误信息作为 Observation
+
+        返回值:
+          最终答案字符串，或 "Agent stopped due to max steps."
+
+        异常:
+          仅致命错误会向外抛出；可恢复错误在循环内处理，不会传播异常。
         """
         logger.info(f"{'═'*50}\n  Question: {question}")
 
@@ -136,20 +131,18 @@ class AgentCore:
             logger.info(f"{'─'*40}\n  Step {step}/{self.max_steps}")
             t_start = time.time()
 
-            # ── State: PROMPT_BUILD ──────────────────────────────────
-            # Render the full ReAct prompt: tool descriptions, user
-            # question, and accumulated thought/action/observation
-            # history. The template controls stop sequences and token
-            # limits, giving the LLM explicit guidance on output format.
+            # ── 状态：PROMPT_BUILD ──────────────────────────────────
+            # 渲染完整的 ReAct 提示词：工具描述、用户问题和累积的
+            # 思考/动作/观测历史。模板控制停止序列和 token 限制，
+            # 为 LLM 提供输出格式的显式指导。
             history_str = "\n".join(history) if history else ""
             prompt = self._template.render_full_prompt(
                 tool_names, tool_descs, current_input, history_str,
             )
 
-            # ── State: LLM_CALL ──────────────────────────────────────
-            # Send the prompt to the LLM backend. The backend handles
-            # tokenization, inference, and stop-sequence detection.
-            # response includes token counts and wall-clock timing.
+            # ── 状态：LLM_CALL ──────────────────────────────────────
+            # 将提示词发送给 LLM 后端。后端负责分词、推理和停止序列检测。
+            # response 包含 token 计数和实时时间统计。
             response = self._llm.generate(
                 prompt=prompt,
                 stop=self._template.stop_sequences,
@@ -160,15 +153,13 @@ class AgentCore:
             logger.info(f"LLM: {response.prompt_tokens}p+{response.completion_tokens}c tokens, {response.duration_ms:.0f}ms")
             logger.debug(f"Raw: {response.text[:200]}")
 
-            # ── State: PARSE ─────────────────────────────────────────
-            # Extract structured fields (thought, action, action_input)
-            # from the unstructured LLM output. The parser uses regex
-            # to match the ReAct format (e.g. "Thought: ...\nAction: ...").
-            # Security: LLM output is untrusted. The parser only applies
-            # string/regex matching — no eval() or exec(). The extracted
-            # fields are passed to tool execution as strings; tool
-            # implementations are responsible for their own input
-            # sanitization.
+            # ── 状态：PARSE ─────────────────────────────────────────
+            # 从非结构化的 LLM 输出中提取结构化字段
+            # （thought、action、action_input）。解析器使用正则表达式
+            # 匹配 ReAct 格式（例如 "Thought: ...\nAction: ..."）。
+            # 安全性：LLM 输出不可信。解析器仅进行字符串/正则匹配——
+            # 不执行 eval() 或 exec()。提取的字段作为字符串传递给
+            # 工具执行；各工具负责自身的输入清理。
             parse_error = None
             try:
                 parsed = self._parser.parse(response.text, tool_names)
@@ -176,28 +167,24 @@ class AgentCore:
                 logger.error(f"Parse failed: {e}")
                 parse_error = str(e)
 
-                # ── Error Recovery Path ──────────────────────────────
-                # Parse failures happen when the LLM deviates from the
-                # expected ReAct output format (e.g., it generates
-                # free-form prose instead of "Thought: ...\nAction: ...").
+                # ── 错误恢复路径 ──────────────────────────────────
+                # 当 LLM 偏离预期的 ReAct 输出格式时发生解析失败
+                # （例如生成了自由形式的散文而非
+                # "Thought: ...\nAction: ..."）。
                 #
-                # Recovery strategy:
-                #   1. Record the raw output as an observation so the
-                #      LLM sees its own output in the next iteration.
-                #   2. Append a formatted "skip" entry to history so
-                #      the prompt structure stays intact.
-                #   3. Provide a meta-instruction ("Based on the
-                #      observation, try again.") that guides the LLM
-                #      back to the ReAct format.
-                #   4. ``continue`` to the next iteration instead of
-                #      crashing — this makes the agent resilient to
-                #      occasional malformed output.
+                # 恢复策略：
+                #   1. 将原始输出记录为 observation，使 LLM 在下次
+                #      迭代中看到自己的输出。
+                #   2. 向历史追加格式化的 "skip" 条目，保持提示结构
+                #      完整。
+                #   3. 提供元指令（"Based on the observation, try again."）
+                #      引导 LLM 回到 ReAct 格式。
+                #   4. ``continue`` 到下一次迭代而非崩溃——使 agent
+                #      对偶尔的格式错误输出具韧性。
                 #
-                # Security note: The raw LLM output is appended to
-                # history verbatim. It is rendered as plain text in
-                # the next prompt — not deserialized, not evaluated.
-                # This prevents prompt-injection escape attempts that
-                # embed control sequences in the LLM output.
+                # 安全说明：原始 LLM 输出原样追加到历史中。它在下次
+                # 提示词中作为纯文本渲染——不反序列化，不评估。
+                # 这防止了在 LLM 输出中嵌入控制序列的提示注入逃逸尝试。
                 if self._collector:
                     self._collector.record_turn(
                         turn=step, question=question, prompt=prompt,
@@ -230,10 +217,10 @@ class AgentCore:
             logger.info(f"  Action: {action}({action_input})")
             logger.trace(f"Input: {action_input}")
 
-            # ── State: DISPATCH -> FINAL_ANSWER ─────────────────────
-            # The LLM signals completion by emitting "final_answer"
-            # as the action. The action_input becomes the final output.
-            # This is the only terminal state besides MAX_STEPS.
+            # ── 状态：DISPATCH -> FINAL_ANSWER ─────────────────────
+            # LLM 通过发出 "final_answer" 作为 action 来信号完成。
+            # action_input 成为最终输出。这是除 MAX_STEPS 之外的
+            # 唯一终止状态。
             if action == "final_answer":
                 logger.info(f"  Final Answer: {action_input}")
                 if self._collector:
@@ -249,24 +236,21 @@ class AgentCore:
                     )
                 return action_input
 
-            # ── State: TOOL_EXEC ─────────────────────────────────────
-            # Dispatch the action to the tool registry. The registry
-            # looks up the tool by name and calls its execute() method.
+            # ── 状态：TOOL_EXEC ─────────────────────────────────────
+            # 将动作分发到工具注册表。注册表按名称查找工具并调用
+            # 其 execute() 方法。
             #
-            # Two recoverable failure modes:
-            #   1. ToolNotFoundError — the LLM hallucinated a tool name.
-            #      The observation lists available tools so the LLM can
-            #      correct itself.
-            #   2. ToolExecutionError — the tool itself failed (e.g.
-            #      network timeout, invalid input). The original error
-            #      message is surfaced (not the exception traceback) to
-            #      avoid leaking internals into the prompt context.
+            # 两种可恢复的故障模式：
+            #   1. ToolNotFoundError——LLM 幻觉出一个不存在的工具名。
+            #      Observation 列出可用工具，以便 LLM 自我修正。
+            #   2. ToolExecutionError——工具本身执行失败
+            #      （例如网络超时、无效输入）。透出原始错误消息
+            #      （非异常堆栈），避免内部信息泄露到提示上下文中。
             #
-            # Security: The action_input string is user-provided (via LLM
-            # output) and is passed to the tool verbatim. Each tool is
-            # responsible for its own input validation and sanitization.
-            # The sandbox layer (agentic.tools.sandbox) provides OS-level
-            # isolation for code-execution tools.
+            # 安全性：action_input 字符串由用户提供（经 LLM 输出）
+            # 并原样传递给工具。每个工具负责自身的输入验证和清理。
+            # 沙箱层（agentic.tools.sandbox）为代码执行工具提供
+            # 操作系统级隔离。
             tool_error = False
             try:
                 observation = self._registry.execute(action, action_input)
@@ -282,7 +266,7 @@ class AgentCore:
 
             logger.info(f"  Observation: {observation}")
 
-            # ── Record trace (if collector configured) ──────────────
+            # ── 记录跟踪（如果配置了 collector）───────────────────
             if self._collector:
                 self._collector.record_turn(
                     turn=step, question=question, prompt=prompt,
@@ -296,36 +280,31 @@ class AgentCore:
                     status="tool_error" if tool_error else "success",
                 )
 
-            # ── State: HISTORY_APPEND ───────────────────────────────
-            # Add the completed turn (thought/action/result) to the
-            # running history. The template controls how each entry is
-            # formatted, which influences what the LLM sees on the
-            # next iteration.
+            # ── 状态：HISTORY_APPEND ───────────────────────────────
+            # 将完成的轮次（思考/动作/结果）添加到运行历史中。
+            # 模板控制每个条目的格式化方式，影响 LLM 在下一次迭代
+            # 中看到的内容。
             #
-            # Injection defense: The observation is appended as a string
-            # value inside a structured template. The template engine
-            # does NOT interpolate it as template directives — it is
-            # plain text substitution only. This prevents an observed
-            # value containing "Thought: ..." from breaking out of the
-            # ReAct format and injecting fake context.
+            # 注入防御：Observation 作为字符串值追加到结构化模板中。
+            # 模板引擎不会将其解释为模板指令——仅进行纯文本替换。
+            # 这防止包含 "Thought: ..." 的观测值突破 ReAct 格式
+            # 并注入伪造上下文。
             history.append(self._template.render_history_entry(
                 thought=thought, action=action,
                 action_input=action_input, observation=observation,
             ))
 
-            # ── State: NEXT_ITERATION ────────────────────────────────
-            # Prepare the user message for the next loop iteration.
-            # The observation from this turn becomes the primary input,
-            # guiding the LLM to reason about what to do next.
+            # ── 状态：NEXT_ITERATION ────────────────────────────────
+            # 为下一次循环迭代准备用户消息。本次迭代的观察结果
+            # 成为主要输入，引导 LLM 推理下一步操作。
             current_input = (
                 f"Based on the observation, what should I do next?\n"
                 f"Observation: {observation}"
             )
 
-        # ── Terminal state: MAX_STEPS ───────────────────────────────
-        # The agent exhausted its step budget without reaching final_answer.
-        # This prevents infinite loops from LLMs that keep calling tools
-        # indefinitely. The caller can distinguish this from a real answer
-        # by the sentinel string.
+        # ── 终止状态：MAX_STEPS ───────────────────────────────────
+        # Agent 耗尽了步骤预算而未达到 final_answer。
+        # 这防止 LLM 无限循环地持续调用工具。
+        # 调用方可以通过哨兵字符串区分真实答案与超时终止。
         logger.warn(f"Max steps ({self.max_steps}) reached. Loop terminated.")
         return "Agent stopped due to max steps."

@@ -1,26 +1,26 @@
 """
-Structured Logging — replaces ts_print() with Python standard logging.
+结构化日志模块 — 用 Python 标准 logging 替代 ts_print()。
 
-Features:
-  - 10 canonical log tags: INIT/AGENT/STEP/LLM/DIFF/TRACE/RESULT/ERROR/WARN/FATAL/HINT
-  - Human-readable format (development) + JSON format (production)
-  - Millisecond-precision timestamps
-  - Log level filtering by environment (REACT_LOG_LEVEL)
-  - Tag-aware LoggerAdapter for consistent formatting
+功能:
+  - 10 个规范日志标签: INIT/AGENT/STEP/LLM/DIFF/TRACE/RESULT/ERROR/WARN/FATAL/HINT
+  - 人类可读格式（开发环境）+ JSON 格式（生产环境）
+  - 毫秒精度时间戳
+  - 按环境变量（REACT_LOG_LEVEL）进行日志级别过滤
+  - 标签感知的 LoggerAdapter，确保一致格式化
 
-Usage:
+用法:
   >>> from agentic.observability import get_logger
   >>> logger = get_logger(__name__)
-  >>> logger.agent("ReAct loop start")
+  >>> logger.agent("ReAct 循环开始")
   >>> logger.llm(prompt_tokens=188, completion_tokens=34, duration_ms=3914)
-  >>> logger.error("Parse failed", extra={"error": str(e)})
+  >>> logger.error("解析失败", extra={"error": str(e)})
 
-Log Format (human):
+日志格式（human）:
   [HH:MM:SS.mmm] [TAG] message
 
-Log Format (json):
+日志格式（json）:
   {"timestamp": "2026-06-21T02:42:31.152", "level": "INFO", "tag": "AGENT",
-   "message": "ReAct loop start", "module": "llama.ReActDemo", ...}
+   "message": "ReAct 循环开始", "module": "llama.ReActDemo", ...}
 """
 
 from __future__ import annotations
@@ -34,29 +34,47 @@ from typing import Any, Dict, Optional, List
 
 
 # ==========================================================================
-# Custom Formatters
+# 自定义格式化器
 # ==========================================================================
 
 class HumanFormatter(logging.Formatter):
     """
-    Human-readable format: [HH:MM:SS.mmm] [TAG] message
+    人类可读的日志格式: [HH:MM:SS.mmm] [TAG] message
 
-    Designed for terminal developers — easy to scan, grep-friendly.
+    功能描述:
+      专为终端开发者设计 — 易于浏览，grep 友好。
+      输出格式简单明了，每行一条日志，包含时间戳、标签和消息。
+
+    处理逻辑:
+      从 LogRecord 中提取或推断标签，使用毫秒精度的时间戳。
     """
-
     def format(self, record: logging.LogRecord) -> str:
-        ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]  # Millisecond precision
+        ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]  # 毫秒精度
         tag = getattr(record, "tag", record.levelname[:4].upper())
         return f"[{ts}] [{tag}] {record.getMessage()}"
 
 
 class JSONFormatter(logging.Formatter):
     """
-    Machine-parseable JSON format for production log aggregation.
+    机器可解析的 JSON 日志格式，适用于生产环境日志聚合。
 
-    Compatible with: ELK stack, Datadog, Splunk, Grafana Loki.
+    功能描述:
+      输出结构化的 JSON 格式日志，兼容 ELK Stack、Datadog、Splunk、Grafana Loki。
+
+    处理逻辑:
+      1. 构建包含 timestamp、level、tag、message、module 的 JSON 对象
+      2. 合并通过 extra 参数传递的额外字段（如 tokens、duration）
+      3. 使用 json.dumps 序列化，确保非 ASCII 字符正常显示
+
+    输出说明:
+      JSON 格式包含：
+        - timestamp: ISO 8601 格式时间戳（UTC）
+        - level: 日志级别
+        - tag: 日志标签
+        - message: 日志消息
+        - module: 模块名
+        - 可选的额外字段（error, prompt_tokens, completion_tokens 等）
     """
-
     def format(self, record: logging.LogRecord) -> str:
         payload: Dict[str, Any] = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -65,7 +83,7 @@ class JSONFormatter(logging.Formatter):
             "message": record.getMessage(),
             "module": record.name,
         }
-        # Merge any extra fields passed via logger.xxx(msg, extra={...})
+        # 合并通过 logger.xxx(msg, extra={...}) 传递的额外字段
         for key in ("error", "prompt_tokens", "completion_tokens", "duration_ms",
                      "step", "thought", "action", "action_input", "observation"):
             val = getattr(record, key, None)
@@ -75,17 +93,21 @@ class JSONFormatter(logging.Formatter):
 
 
 # ==========================================================================
-# Tag-Aware Logger Adapter
+# 标签感知的日志适配器
 # ==========================================================================
 
 class TagAdapter(logging.LoggerAdapter):
     """
-    LoggerAdapter that injects a [TAG] into every log record.
+    向每一条日志记录注入 [TAG] 标签的 LoggerAdapter。
 
-    Provides convenience methods for each of the 10 canonical tags,
-    plus structured kwargs for LLM token/duration data.
+    功能描述:
+      提供 10 个规范标签的便捷方法，以及用于 LLM token/时长数据的结构化 kwargs。
+      简化日志调用，避免手动设置标签。
+
+    使用方法:
+      logger.agent("消息") → [HH:MM:SS.mmm] [AGENT] 消息
+      logger.llm(prompt_tokens=100, completion_tokens=50) → [HH:MM:SS.mmm] [LLM] ...
     """
-
     def __init__(self, logger: logging.Logger):
         super().__init__(logger, {"tag": "INFO"})
 
@@ -101,94 +123,102 @@ class TagAdapter(logging.LoggerAdapter):
     def _log_with_tag(self, level: int, tag: str, msg: str, **kwargs):
         extra = kwargs.pop("extra", {})
         extra["tag"] = tag
-        # Forward structured fields to the record
+        # 将结构化字段转发到日志记录
         for k, v in kwargs.items():
             extra[k] = v
         self.log(level, msg, extra=extra)
 
-    # ── Canonical tag methods ──────────────────────────────────────
+    # ── 规范标签方法 ──────────────────────────────────────
 
     def init(self, msg: str, **kwargs):
-        """[INIT] System initialization — model loading."""
+        """[INIT] 系统初始化 — 模型加载等。"""
         self._log_with_tag(logging.INFO, "INIT", msg, **kwargs)
 
     def agent(self, msg: str, **kwargs):
-        """[AGENT] Agent session lifecycle — start/question."""
+        """[AGENT] Agent 会话生命周期 — 开始/问题。"""
         self._log_with_tag(logging.INFO, "AGENT", msg, **kwargs)
 
     def step(self, msg: str, **kwargs):
-        """[STEP] ReAct loop iteration boundary."""
+        """[STEP] ReAct 循环迭代边界。"""
         self._log_with_tag(logging.INFO, "STEP", msg, **kwargs)
 
     def llm(self, msg: str = "", *, prompt_tokens: int = 0, completion_tokens: int = 0,
             duration_ms: float = 0, raw_output: str = "", **kwargs):
-        """[LLM] LLM inference call — tokens + duration."""
+        """[LLM] LLM 推理调用 — token 数量 + 耗时。"""
         text = msg or f"prompt={prompt_tokens}  completion={completion_tokens}  duration={duration_ms:.0f}ms"
         if raw_output:
-            text = f"Raw: {raw_output[:200]}\n{text}"
+            text = f"原始输出: {raw_output[:200]}\n{text}"
         self._log_with_tag(logging.DEBUG, "LLM", text,
                            prompt_tokens=prompt_tokens,
                            completion_tokens=completion_tokens,
                            duration_ms=duration_ms, **kwargs)
 
     def diff(self, msg: str, **kwargs):
-        """[DIFF] Cross-turn data difference summary."""
+        """[DIFF] 跨轮数据差异摘要。"""
         self._log_with_tag(logging.DEBUG, "DIFF", msg, **kwargs)
 
     def trace(self, msg: str, **kwargs):
-        """[TRACE] Agent state — Thought/Action/Observation."""
+        """[TRACE] Agent 状态 — Thought/Action/Observation。"""
         self._log_with_tag(logging.INFO, "TRACE", msg, **kwargs)
 
     def result(self, msg: str, **kwargs):
-        """[RESULT] Final answer or function return."""
+        """[RESULT] 最终答案或函数返回。"""
         self._log_with_tag(logging.INFO, "RESULT", msg, **kwargs)
 
     def error(self, msg: str, **kwargs):
-        """[ERROR] Recoverable error (in-loop retry)."""
+        """[ERROR] 可恢复错误（循环内重试）。"""
         self._log_with_tag(logging.WARNING, "ERROR", msg, **kwargs)
 
     def warn(self, msg: str, **kwargs):
-        """[WARN] Warning threshold exceeded."""
+        """[WARN] 超过警告阈值。"""
         self._log_with_tag(logging.WARNING, "WARN", msg, **kwargs)
 
     def fatal(self, msg: str, **kwargs):
-        """[FATAL] Unrecoverable error — process will exit."""
+        """[FATAL] 不可恢复错误 — 进程将退出。"""
         self._log_with_tag(logging.CRITICAL, "FATAL", msg, **kwargs)
 
     def hint(self, msg: str, **kwargs):
-        """[HINT] Remediation suggestion — paired with FATAL."""
+        """[HINT] 修复建议 — 与 FATAL 配对使用。"""
         self._log_with_tag(logging.INFO, "HINT", msg, **kwargs)
 
 
 # ==========================================================================
-# Logger Factory
+# 日志工厂函数
 # ==========================================================================
 
 def setup_logging(level: str = "INFO", log_format: str = "human",
                   log_file: Optional[str] = None) -> None:
     """
-    Configure the root logger for the ReAct Agent.
+    配置 ReAct Agent 的根日志记录器。
 
-    Output destinations:
-      - stdout (always) — terminal / container logs
-      - log file (optional) — persistent, auto-rotated daily
+    功能描述:
+      初始化日志系统，配置输出目标和格式。
+      可同时输出到标准输出和日志文件。
 
-    Args:
-      level:   DEBUG | INFO | WARNING | ERROR | CRITICAL
-      log_format: "human" (terminal-friendly) or "json" (machine-parseable)
-      log_file: Optional path to log file. Auto-creates parent dirs.
-                If None, logs only to stdout.
+    参数:
+      level:     日志级别，可选 DEBUG | INFO | WARNING | ERROR | CRITICAL
+      log_format: "human"（终端友好）或 "json"（机器可解析）
+      log_file:  可选的日志文件路径。自动创建父目录。
+                 如果为 None，仅输出到 stdout。
 
-    Called once at process start (main.py). Idempotent.
+    处理逻辑:
+      1. 获取名为 "llama" 的根日志记录器
+      2. 设置日志级别
+      3. 清除已有 handler 确保幂等性
+      4. 添加 stdout handler
+      5. 如果指定了 log_file，添加文件 handler（自动创建目录）
+
+    注意事项:
+      在进程启动时调用一次（main.py 中）。幂等操作，可重复调用。
     """
-    root = logging.getLogger("llama")
+    root = logging.getLogger("agentic")
     root.setLevel(getattr(logging, level.upper(), logging.INFO))
 
-    # Remove existing handlers to ensure idempotency
+    # 清除已有 handler 以确保幂等性
     root.handlers.clear()
 
     handler = logging.StreamHandler(sys.stdout)
-    handler.setLevel(logging.DEBUG)  # Handler passes everything; logger filters
+    handler.setLevel(logging.DEBUG)  # Handler 不过滤；由 logger 级别控制
 
     if log_format == "json":
         formatter = JSONFormatter()
@@ -198,7 +228,7 @@ def setup_logging(level: str = "INFO", log_format: str = "human",
     handler.setFormatter(formatter)
     root.addHandler(handler)
 
-    # ── Optional file handler for persistent logs ─────────────────
+    # ── 可选的文件 handler，用于持久化日志 ─────────────────
     if log_file:
         os.makedirs(os.path.dirname(log_file), exist_ok=True)
         fh = logging.FileHandler(log_file, encoding='utf-8')
@@ -209,25 +239,29 @@ def setup_logging(level: str = "INFO", log_format: str = "human",
 
 def get_logger(name: str) -> TagAdapter:
     """
-    Get a TagAdapter-wrapped logger for the given module name.
+    获取为指定模块名包装的 TagAdapter 日志器。
 
-    Args:
-      name: usually __name__ from the calling module
+    功能描述:
+      创建或获取一个标准 logging.Logger，并包装为 TagAdapter，
+      提供便捷的标签化日志方法。
 
-    Returns:
-      TagAdapter with canonical tag methods.
+    参数:
+      name: 通常是调用模块的 __name__
 
-    Usage:
+    返回:
+      带有规范标签方法的 TagAdapter 实例。
+
+    用法:
       >>> from agentic.observability import get_logger
       >>> logger = get_logger(__name__)
-      >>> logger.agent("ReAct loop start")
+      >>> logger.agent("ReAct 循环开始")
       >>> logger.llm(prompt_tokens=188, completion_tokens=34, duration_ms=3914.0)
     """
     logger = logging.getLogger(name)
     return TagAdapter(logger)
 
 
-# ── Auto-initialize from environment (if not already configured) ──
+# ── 从环境变量自动初始化（如果尚未配置） ──
 
 if not logging.getLogger("agentic").handlers:
     _level = os.getenv("REACT_LOG_LEVEL", "INFO")

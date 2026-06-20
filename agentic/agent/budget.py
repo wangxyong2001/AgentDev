@@ -1,19 +1,18 @@
 """
-Token Budget + Circuit Breaker for ReAct Agent.
+ReAct Agent 的 Token 预算与断路器。
 
-Prevents runaway recursion loops and unbounded token consumption — the
-primary cause of $16K-$50K cost incidents on edge hardware (Jetson Orin/GB10).
+防止失控的递归循环和无限制的 token 消耗——这是在边缘硬件
+（Jetson Orin/GB10）上产生 $16K-$50K 成本事故的主要原因。
 
 TokenBudget:
-  Budget manager that checks BEFORE every LLM call. Uses a len//4 heuristic
-  for fast estimation and accumulates spend against a configurable max.
+  预算管理器，在每次 LLM 调用前进行检查。使用 len//4 启发式方法
+  进行快速估算，并针对可配置的上限累积消耗。
 
 CircuitBreaker:
-  Dual-limit breaker combining turn_count + token_budget. Raises
-  CircuitBreakerError when either limit is exceeded — agent must stop
-  immediately.
+  双重限制断路器，结合 turn_count（轮次数）+ token_budget（token 预算）。
+  任一种限制超限时抛出 CircuitBreakerError——Agent 必须立即停止。
 
-Usage:
+用法：
   >>> from agentic.agent.budget import TokenBudget, CircuitBreaker, CircuitBreakerError
   >>> budget = TokenBudget(max_tokens=4096, warning_ratio=0.8)
   >>> breaker = CircuitBreaker(max_turns=10, token_budget=budget)
@@ -33,14 +32,14 @@ from typing import Optional
 # ==========================================================================
 
 class TokenBudget:
-    """Token budget manager — checks BEFORE every LLM call.
+    """Token 预算管理器——在每次 LLM 调用前进行检查。
 
-    Uses a fast len//4 heuristic for token estimation. Accumulates spend
-    and provides warning/remaining signals for monitoring.
+    使用快速 len//4 启发式方法估算 token 数量。累积消耗并提供
+    警告和剩余信号用于监控。
 
-    Args:
-      max_tokens: Hard ceiling on total token consumption across a run.
-      warning_ratio: Fraction of max_tokens that triggers the warning flag.
+    参数:
+      max_tokens: 单次运行中总 token 消耗的硬上限。
+      warning_ratio: 触发警告标志的 max_tokens 比例阈值。
     """
 
     def __init__(self, max_tokens: int, warning_ratio: float = 0.8):
@@ -49,32 +48,31 @@ class TokenBudget:
         self.accumulated = 0
 
     def estimate(self, prompt: str) -> int:
-        """Estimate tokens from prompt string (len//4 heuristic).
+        """根据提示字符串估算 token 数量（len//4 启发式方法）。
 
-        This is a fast, zero-dependency approximation. For production
-        use with LLM backends, replace with the backend's tokenizer.
+        这是一个快速、零依赖的近似估算。生产环境使用 LLM 后端时，
+        应替换为后端的 tokenizer。
 
-        Args:
-          prompt: The prompt string to estimate.
+        参数:
+          prompt: 待估算的提示字符串。
 
-        Returns:
-          Estimated token count.
+        返回值:
+          估算的 token 数量。
         """
         return len(prompt) // 4
 
     def check_and_reserve(self, estimated: int) -> bool:
-        """Check if estimated tokens fit in budget. Returns True if safe.
+        """检查估算的 token 是否在预算内。安全时返回 True。
 
-        Atomically checks the budget AND reserves the tokens in one call.
-        This prevents race conditions where multiple checks pass but the
-        cumulative spend exceeds max_tokens.
+        在一个调用中原子性地检查预算并预留 token。
+        这防止了多次检查通过但累积消耗超出 max_tokens 的竞态条件。
 
-        Args:
-          estimated: Estimated token count for the upcoming call.
+        参数:
+          estimated: 即将进行的调用所需的估算 token 数。
 
-        Returns:
-          True if the call fits within remaining budget (tokens reserved).
-          False if the budget would be exceeded (no tokens reserved).
+        返回值:
+          True 表示调用在剩余预算内（token 已预留）。
+          False 表示会超出预算（未预留任何 token）。
         """
         if self.accumulated + estimated > self.max_tokens:
             return False
@@ -83,12 +81,12 @@ class TokenBudget:
 
     @property
     def warning(self) -> bool:
-        """Return True if accumulated tokens meet or exceed warning threshold."""
+        """如果累积 token 达到或超过警告阈值则返回 True。"""
         return self.accumulated >= self.warning_threshold
 
     @property
     def remaining(self) -> int:
-        """Return remaining tokens before max_tokens is exhausted."""
+        """返回耗尽 max_tokens 前的剩余 token 数。"""
         return max(0, self.max_tokens - self.accumulated)
 
     def __repr__(self) -> str:
@@ -104,10 +102,10 @@ class TokenBudget:
 # ==========================================================================
 
 class CircuitBreakerError(Exception):
-    """Raised when circuit breaker trips — agent must stop immediately.
+    """断路器跳闸时抛出——Agent 必须立即停止。
 
-    Carries a human-readable message indicating which limit was exceeded
-    (turn count or token budget) and the configured max value.
+    携带人类可读的消息，指示哪个限制被超出
+    （轮次数或 token 预算）以及配置的最大值。
     """
 
     def __init__(self, message: str):
@@ -120,18 +118,18 @@ class CircuitBreakerError(Exception):
 # ==========================================================================
 
 class CircuitBreaker:
-    """Dual-limit breaker: turn_count + token_count.
+    """双重限制断路器：turn_count（轮次数）+ token_count（token 数）。
 
-    Checked BEFORE every LLM invocation. Prevents two classes of runaway:
+    在每次 LLM 调用前进行检查。防止两类失控情况：
 
-      1. Turn loops: model refuses to produce final_answer and cycles forever.
-      2. Token blowout: each turn's prompt grows unboundedly with history.
+      1. 轮次循环：模型拒绝产生 final_answer 并无限循环。
+      2. Token 暴增：每轮的提示词因历史累积而无限制增长。
 
-    Both limits are independent — whichever trips first stops the agent.
+    两个限制相互独立——任一个先触及时即停止 Agent。
 
-    Args:
-      max_turns: Maximum ReAct turns before forced stop.
-      token_budget: TokenBudget instance for token-aware limiting.
+    参数:
+      max_turns: 强制停止前的最大 ReAct 轮次数。
+      token_budget: TokenBudget 实例，用于 token 感知的限制。
     """
 
     def __init__(self, max_turns: int, token_budget: TokenBudget):
@@ -140,18 +138,17 @@ class CircuitBreaker:
         self.turn_count = 0
 
     def check_before_call(self, prompt: str):
-        """Call BEFORE every LLM invocation. Raises CircuitBreakerError.
+        """在每次 LLM 调用前调用。超出限制时抛出 CircuitBreakerError。
 
-        Increments turn count, estimates token cost of the prompt, and
-        checks both limits. This is a single call site to prevent missing
-        a check in any code path.
+        增加轮次计数，估算提示词的 token 成本，并检查两项限制。
+        这是单个调用点，防止在任何代码路径中遗漏检查。
 
-        Args:
-          prompt: The prompt about to be sent to the LLM.
+        参数:
+          prompt: 即将发送给 LLM 的提示词。
 
-        Raises:
-          CircuitBreakerError: If turn limit exceeded or token budget
-            would be exceeded by this call.
+        异常:
+          CircuitBreakerError: 如果超出轮次限制，或本次调用
+            将超出 token 预算。
         """
         self.turn_count += 1
         if self.turn_count > self.max_turns:
@@ -165,9 +162,9 @@ class CircuitBreaker:
             )
 
     def reset(self):
-        """Reset both turn count and accumulated tokens.
+        """重置轮次计数和累积 token 数。
 
-        Used when reusing a CircuitBreaker across independent agent runs.
+        用于在跨独立 Agent 运行间复用 CircuitBreaker 时。
         """
         self.turn_count = 0
         self.token_budget.accumulated = 0

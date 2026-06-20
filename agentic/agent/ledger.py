@@ -1,21 +1,19 @@
 """
-Append-only SQLite audit ledger with SHA-256 hash chaining.
+带 SHA-256 哈希链的仅追加 SQLite 审计账本。
 
-Provides tamper-evident audit trail for ReAct agent invocations. Every
-row is cryptographically linked to its predecessor, enabling integrity
-verification and external anchoring via Merkle roots.
+为 ReAct Agent 调用提供防篡改审计追踪。每行通过密码学方式链接到
+前一行，支持完整性验证和通过默克尔根进行外部锚定。
 
-Design:
-  - SHA-256 hash chain: each row stores prev_span_hash (hash of prior row)
-    and row_hash (hash of its own content). Tampering any row breaks the
-    chain for all subsequent rows.
-  - Never stores raw inputs/outputs — only SHA-256 hashes.
-  - Append-only: only INSERT operations; no UPDATE or DELETE paths.
-  - Auto-rotation: at 10 MB the active file is renamed, keeping at most
-    3 rotated files on disk.
-  - Pure Python stdlib: sqlite3, hashlib, json, datetime — zero deps.
+设计：
+  - SHA-256 哈希链：每行存储 prev_span_hash（前一行哈希）和
+    row_hash（自身内容哈希）。篡改任一行会破坏该行之后所有行的链条。
+  - 永不存储原始输入/输出——仅存储 SHA-256 哈希。
+  - 仅追加：只有 INSERT 操作；无 UPDATE 或 DELETE 路径。
+  - 自动轮转：达到 10 MB 时重命名当前文件，磁盘上最多保留 3 个
+    轮转文件。
+  - 纯 Python 标准库：sqlite3、hashlib、json、datetime——零依赖。
 
-Usage:
+用法：
   >>> from agentic.agent.ledger import AuditLedger
   >>> ledger = AuditLedger(db_path="./agent_audit.db")
   >>> ledger.append(
@@ -48,12 +46,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 # ==========================================================================
-# Constants
+# 常量
 # ==========================================================================
 
 _GENESIS_HASH = hashlib.sha256(b"GENESIS").hexdigest()
 _ROTATION_MAX_BYTES = 10 * 1024 * 1024  # 10 MB
-_ROTATION_KEEP = 3  # keep last 3 rotated files
+_ROTATION_KEEP = 3  # 保留最近 3 个轮转文件
 
 
 # ==========================================================================
@@ -61,20 +59,18 @@ _ROTATION_KEEP = 3  # keep last 3 rotated files
 # ==========================================================================
 
 class AuditLedger:
-    """Append-only SQLite audit ledger with SHA-256 hash chaining.
+    """带 SHA-256 哈希链的仅追加 SQLite 审计账本。
 
-    Every record hashes its content (including the previous row's hash)
-    into a SHA-256 digest stored as ``row_hash``. This creates a tamper-
-    evident chain: changing any field in any row invalidates that row's
-    hash and all downstream hashes.
+    每条记录将其内容（包括前一行的哈希）哈希为 SHA-256 摘要，
+    存储为 ``row_hash``。这创建了一条防篡改链：修改任一行中的
+    任何字段会使该行的哈希及所有后续行的哈希失效。
 
-    The ledger auto-rotates to prevent unbounded disk growth. When the
-    active file exceeds 10 MB it is renamed to ``<path>.1``; older files
-    cascade (``.1`` -> ``.2`` -> ``.3`` -> deleted).
+    账本自动轮转以防止无限制的磁盘增长。当活动文件超过 10 MB 时，
+    重命名为 ``<path>.1``；旧文件级联重命名（``.1`` -> ``.2`` ->
+    ``.3`` -> 删除）。
 
-    Args:
-      db_path: Path to the SQLite database file.
-        Default: ``./agent_audit.db``
+    参数:
+      db_path: SQLite 数据库文件路径。默认为 ``./agent_audit.db``。
     """
 
     def __init__(self, db_path: str = None):
@@ -84,7 +80,7 @@ class AuditLedger:
         self._db_path = os.path.abspath(db_path)
         self._conn: Optional[sqlite3.Connection] = None
 
-    # ── Connection management ──────────────────────────────────────────
+    # ── 连接管理 ──────────────────────────────────────────────────────────
 
     def __enter__(self):
         self.connect()
@@ -94,13 +90,12 @@ class AuditLedger:
         self.close()
 
     def connect(self) -> sqlite3.Connection:
-        """Open or reopen the SQLite connection and ensure the schema exists.
+        """打开或重新打开 SQLite 连接，并确保 Schema 存在。
 
-        Returns the connection for advanced use (callers should prefere the
-        ``append()`` and query methods).
+        返回连接以供高级使用（调用者应优先使用 ``append()`` 和查询方法）。
 
-        The database is opened in WAL mode for concurrent-read performance,
-        but writes remain serialized via SQLite's internal locking.
+        数据库以 WAL 模式打开以获得并发读取性能，但写入仍通过 SQLite
+        内部锁定保持序列化。
         """
         if self._conn is not None:
             return self._conn
@@ -113,101 +108,102 @@ class AuditLedger:
         return self._conn
 
     def close(self) -> None:
-        """Close the database connection."""
+        """关闭数据库连接。"""
         if self._conn is not None:
             self._conn.close()
             self._conn = None
 
     @property
     def db_path(self) -> str:
-        """Return the absolute path of the active database file."""
+        """返回当前活动数据库文件的绝对路径。"""
         return self._db_path
 
     # ── Schema ─────────────────────────────────────────────────────────
 
     def _ensure_schema(self) -> None:
-        """Create the audit_ledger table if it does not exist.
+        """如果 audit_ledger 表不存在则创建。
 
-        Schema notes:
-          ``prev_span_hash`` and ``row_hash`` implement the hash chain:
-          each row's ``row_hash`` = SHA-256(fields), and the next row's
-          ``prev_span_hash`` = prior row's ``row_hash``. The first row
-          uses ``_GENESIS_HASH`` as its predecessor.
+        Schema 说明：
+          ``prev_span_hash`` 和 ``row_hash`` 实现哈希链：
+          每行的 ``row_hash`` = SHA-256(字段)，下一行的
+          ``prev_span_hash`` = 前一行 ``row_hash``。第一行
+          使用 ``_GENESIS_HASH`` 作为其前驱哈希。
 
-          ``input_hash`` and ``output_hash`` are SHA-256 digests of the
-          raw input/output — the plaintext is never stored on disk.
-          This lets us detect tampering without retaining sensitive data.
+          ``input_hash`` 和 ``output_hash`` 是原始输入/输出的
+          SHA-256 摘要——明文永不存储在磁盘上。
+          这样可以在不保留敏感数据的情况下检测篡改。
 
-          ``compliance_tags`` is a JSON array of framework identifiers
-          (e.g. ``["SOC2_CC7.2", "GDPR_Art32"]``) stored as TEXT.
+          ``compliance_tags`` 是合规框架标识符的 JSON 数组
+          （例如 ``["SOC2_CC7.2", "GDPR_Art32"]``），以 TEXT 类型存储。
         """
         assert self._conn is not None
         self._conn.executescript("""
             CREATE TABLE IF NOT EXISTS audit_ledger (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                    -- Monotonically increasing row ID. Used for ordering
-                    -- the hash chain and as a durable row identifier.
+                    -- 单调递增的行 ID。用于排序哈希链
+                    -- 并作为持久化的行标识符。
 
                 session_id      TEXT NOT NULL,
-                    -- Logical agent run identifier (e.g. "run-001").
-                    -- Multiple spans/steps share the same session_id.
+                    -- 逻辑 Agent 运行标识符（例如 "run-001"）。
+                    -- 多个跨度/步骤共享相同的 session_id。
 
                 span_id         TEXT NOT NULL,
-                    -- Identifier for the specific span within a session
-                    -- (e.g. "step-3", "tool-calc-1").
+                    -- 会话中特定跨度的标识符
+                    -- （例如 "step-3"、"tool-calc-1"）。
 
                 prev_span_hash  TEXT,
-                    -- SHA-256 hex digest of the PREVIOUS row's row_hash.
-                    -- NULL for the first row (genesis). Links this row
-                    -- to its predecessor in the tamper-evident chain.
+                    -- 前一行 row_hash 的 SHA-256 十六进制摘要。
+                    -- 第一行（创世行）为 NULL。将该行链接到
+                    -- 防篡改链中的前驱。
 
                 event_type      TEXT NOT NULL,
-                    -- Categorizes the event: "llm_call", "tool_exec",
-                    -- "agent_start", "agent_end", "error", etc.
+                    -- 事件分类："llm_call"、"tool_exec"、
+                    -- "agent_start"、"agent_end"、"error" 等。
 
                 actor           TEXT NOT NULL,
-                    -- Entity that performed the action (e.g. "agent",
-                    -- "user", "system").
+                    -- 执行动作的实体（例如 "agent"、
+                    -- "user"、"system"）。
 
                 resource        TEXT NOT NULL,
-                    -- Resource acted upon (e.g. "llm:qwen2.5:7b",
-                    -- "tool:calculator", "file:/tmp/data.csv").
+                    -- 被操作的资源（例如 "llm:qwen2.5:7b"、
+                    -- "tool:calculator"、"file:/tmp/data.csv"）。
 
                 input_hash      TEXT,
-                    -- SHA-256 of the input to the action. NULL when
-                    -- there is no input (e.g. agent_start events).
-                    -- Stores ONLY the hash, never the plaintext.
+                    -- 动作输入的 SHA-256 哈希。无输入时
+                    -- 为 NULL（例如 agent_start 事件）。
+                    -- 仅存储哈希，永不存明文。
 
                 output_hash     TEXT,
-                    -- SHA-256 of the output from the action. NULL when
-                    -- there is no output. Same privacy-by-hash design.
+                    -- 动作输出的 SHA-256 哈希。无输出时
+                    -- 为 NULL。同样采用哈希保护隐私设计。
 
                 decision        TEXT,
-                    -- High-level outcome: "next_turn", "final_answer",
-                    -- "error_parse", "error_tool", "continue", etc.
+                    -- 高层级结果："next_turn"、"final_answer"、
+                    -- "error_parse"、"error_tool"、"continue" 等。
 
                 token_delta     INTEGER,
-                    -- Number of tokens consumed by this event (prompt
-                    -- + completion for LLM calls, 0 for tool execs).
+                    -- 此事件消耗的 token 数量（LLM 调用的
+                    -- 提示 + 补全，工具执行为 0）。
 
                 duration_ms     INTEGER,
-                    -- Wall-clock duration of the event in milliseconds.
+                    -- 事件持续的挂钟时间（毫秒）。
 
                 compliance_tags TEXT,
-                    -- JSON array of compliance framework tags, e.g.
-                    -- '["SOC2_CC7.2","GDPR_Art32"]'. Stored as TEXT
-                    -- to keep the schema portable (no JSON type needed).
+                    -- 合规框架标签的 JSON 数组，例如
+                    -- '["SOC2_CC7.2","GDPR_Art32"]'。以 TEXT
+                    -- 类型存储以保持 Schema 可移植性
+                    -- （无需 JSON 类型）。
 
                 created_at      TEXT NOT NULL,
-                    -- ISO 8601 UTC timestamp with fractional seconds:
-                    -- "2026-06-21T14:30:00.123456Z". Set at insertion
-                    -- time; not updated on read/verify.
+                    -- ISO 8601 UTC 时间戳，含小数秒：
+                    -- "2026-06-21T14:30:00.123456Z"。插入时
+                    -- 设置；读取/验证时不更新。
 
                 row_hash        TEXT NOT NULL UNIQUE
-                    -- SHA-256 hex digest of ALL other fields in this
-                    -- row (excluding id and row_hash itself). The UNIQUE
-                    -- constraint prevents hash collisions (astronomically
-                    -- unlikely but enforced at the DB level).
+                    -- 该行除 id 和 row_hash 本身外所有其他
+                    -- 字段的 SHA-256 十六进制摘要。UNIQUE
+                    -- 约束防止哈希碰撞（概率极低但在数据库
+                    -- 层面强制执行）。
             );
 
             CREATE INDEX IF NOT EXISTS idx_audit_session
@@ -233,46 +229,39 @@ class AuditLedger:
         duration_ms: Optional[int] = None,
         compliance_tags: Optional[List[str]] = None,
     ) -> str:
-        """Append a new audit record.
+        """追加一条新的审计记录。
 
-        This is the only write path — there are no UPDATE or DELETE
-        operations. The method:
+        这是唯一的写入路径——没有 UPDATE 或 DELETE 操作。该方法：
 
-        1. Hashes ``input_text`` and ``output_text`` (plaintext is
-           never persisted).
-        2. Retrieves the previous row's ``row_hash`` to form the
-           hash chain.
-        3. Builds a deterministic content string from all fields.
-        4. SHA-256 hashes that string to produce ``row_hash``.
-        5. Inserts the row and commits.
+        1. 对 ``input_text`` 和 ``output_text`` 做哈希处理
+           （明文永不持久化）。
+        2. 获取前一行 ``row_hash`` 以形成哈希链。
+        3. 从所有字段构建确定性内容字符串。
+        4. 对该字符串进行 SHA-256 哈希以生成 ``row_hash``。
+        5. 插入行并提交事务。
 
-        Args:
-          session_id: Identifier for the agent run session.
-          span_id: Identifier for the specific span/step within the session.
-          event_type: Type of event (e.g. ``"llm_call"``, ``"tool_exec"``).
-          actor: Entity that performed the action (e.g. ``"agent"``).
-          resource: Resource acted upon (e.g. ``"llm:qwen2.5:7b"``).
-          input_text: Raw input text (will be SHA-256 hashed — never stored
-            as-is).
-          output_text: Raw output text (will be SHA-256 hashed — never
-            stored as-is).
-          decision: Outcome decision (e.g. ``"next_turn"``,
-            ``"final_answer"``).
-          token_delta: Token count consumed by this event.
-          duration_ms: Duration of the event in milliseconds.
-          compliance_tags: List of compliance framework tags (e.g.
-            ``["SOC2_CC7.2"]``).
+        参数:
+          session_id: Agent 运行会话的标识符。
+          span_id: 会话中特定跨度/步骤的标识符。
+          event_type: 事件类型（例如 ``"llm_call"``、``"tool_exec"``）。
+          actor: 执行动作的实体（例如 ``"agent"``）。
+          resource: 被操作的资源（例如 ``"llm:qwen2.5:7b"``）。
+          input_text: 原始输入文本（将作 SHA-256 哈希——永不原样存储）。
+          output_text: 原始输出文本（将作 SHA-256 哈希——永不原样存储）。
+          decision: 结果决策（例如 ``"next_turn"``、``"final_answer"``）。
+          token_delta: 此事件消耗的 token 数量。
+          duration_ms: 事件持续毫秒数。
+          compliance_tags: 合规框架标签列表（例如 ``["SOC2_CC7.2"]``）。
 
-        Returns:
-          The ``row_hash`` (SHA-256 hex digest) of the newly inserted row.
+        返回值:
+          新插入行的 ``row_hash``（SHA-256 十六进制摘要）。
         """
         conn = self.connect()
 
-        # ── Hash input/output (never store raw content) ─────────────
-        # Privacy-by-design: only SHA-256 digests are persisted. This
-        # prevents the database from becoming a sensitive-data repository
-        # while preserving the ability to verify integrity (you re-hash
-        # the suspected plaintext and compare).
+        # ── 对输入/输出做哈希处理（永不存储原始内容） ─────────────
+        # 隐私设计：仅持久化 SHA-256 摘要。这防止数据库成为
+        # 敏感数据仓库，同时保留完整性验证能力（对疑似明文
+        # 重新哈希并比对）。
         input_hash = (
             hashlib.sha256(input_text.encode("utf-8")).hexdigest()
             if input_text is not None
@@ -287,18 +276,16 @@ class AuditLedger:
         created_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
         tags_json = json.dumps(compliance_tags or [])
 
-        # ── Hash chain linkage ──────────────────────────────────────
-        # Retrieve the previous row's row_hash to create the cryptographic
-        # link: the current row's content includes prev_span_hash, which
-        # equals the prior row's row_hash.  A tamper of any row changes
-        # its row_hash, which breaks the downstream chain.
+        # ── 哈希链链接 ──────────────────────────────────────────────
+        # 获取前一行 row_hash 以创建密码学链接：当前行的内容包括
+        # prev_span_hash，它等于前一行 row_hash。篡改任一行会改变
+        # 其 row_hash，进而破坏下游链。
         prev_hash = self._get_last_row_hash()
 
-        # ── Compute row_hash ────────────────────────────────────────
-        # Build a deterministic string representing ALL columns except
-        # ``id`` (surrogate, not content) and ``row_hash`` (the output).
-        # Hash that string with SHA-256 to produce this row's integrity
-        # check value.
+        # ── 计算 row_hash ────────────────────────────────────────────
+        # 构建确定性字符串，表示除 ``id``（代理键，非内容）和
+        # ``row_hash``（输出）外的所有列。用 SHA-256 哈希该字符串
+        # 以生成该行的完整性校验值。
         content_string = self._build_content_string(
             session_id=session_id,
             span_id=span_id,
@@ -344,13 +331,13 @@ class AuditLedger:
         )
         conn.commit()
 
-        # Check rotation after write
+        # 写入后检查是否需要轮转
         self._maybe_rotate()
 
         return row_hash
 
     def _get_last_row_hash(self) -> str:
-        """Return the row_hash of the most recent row, or GENESIS hash."""
+        """返回最近一行的 row_hash，无行时返回创世哈希。"""
         assert self._conn is not None
         cursor = self._conn.execute(
             "SELECT row_hash FROM audit_ledger ORDER BY id DESC LIMIT 1"
@@ -360,34 +347,27 @@ class AuditLedger:
 
     @staticmethod
     def _build_content_string(**fields: Any) -> str:
-        """Deterministic serialization of row fields for hashing.
+        """用于哈希的行字段确定性序列化。
 
-        The hash-chain algorithm works as follows:
-          1. All row fields (all kwargs) are sorted alphabetically by
-             key. This guarantees cross-platform reproducibility —
-             Python dict iteration order (insertion order since 3.7)
-             is not relied upon.
-          2. Each field is serialized as ``key=value``. None values
-             become the literal string ``"None"`` (not Python's None
-             literal or JSON null) to keep the representation simple
-             and deterministic.
-          3. Fields are joined with ``|`` (pipe) — a character that
-             cannot appear in SHA-256 hex digests and is unlikely to
-             appear in tag values, avoiding delimiter collisions.
-          4. The resulting string is SHA-256-hashed to produce
-             ``row_hash``.
+        哈希链算法工作原理如下：
+          1. 所有行字段（所有 kwargs）按键名按字母排序。这保证了
+             跨平台可重现性——不依赖 Python 字典迭代顺序
+             （自 3.7 起为插入顺序）。
+          2. 每个字段序列化为 ``key=value``。None 值变为字面字符串
+             ``"None"``（非 Python 的 None 字面量或 JSON null），
+             以保持表示简单且确定。
+          3. 字段用 ``|``（管道符）连接——该字符不会出现在 SHA-256
+             十六进制摘要中，也不太可能出现在标签值中，避免分隔符冲突。
+          4. 结果字符串经 SHA-256 哈希生成 ``row_hash``。
 
-        Why sort?  Without sorting, inserting a new field or changing
-        keyword argument order would produce a different content string
-        even if the logical values were identical.  Sorting makes the
-        hash robust to parameter ordering changes in the code.
+        为何排序？不排序的话，插入新字段或更改关键字参数顺序会产生
+        不同的内容字符串，即使逻辑值相同。排序使哈希在参数顺序变化
+        时保持健壮。
 
-        Why exclude ``id`` and ``row_hash`` from the content?
-          - ``id`` is a sequential surrogate key assigned by SQLite.
-            Including it would couple the hash to the insertion order
-            rather than the logical content.
-          - ``row_hash`` is the output of this function — it cannot
-            be an input to itself.
+        为何从内容中排除 ``id`` 和 ``row_hash``？
+          - ``id`` 是 SQLite 分配的递增序列代理键。包含它会将哈希
+            耦合到插入顺序而非逻辑内容。
+          - ``row_hash`` 是该函数的输出——它不能作为自身的输入。
         """
         parts: List[str] = []
         for key in sorted(fields.keys()):
@@ -398,40 +378,37 @@ class AuditLedger:
                 parts.append(f"{key}={value}")
         return "|".join(parts)
 
-    # ── Verification ───────────────────────────────────────────────────
+    # ── 验证 ───────────────────────────────────────────────────────────────
 
     def verify_chain(self, db_path: Optional[str] = None) -> bool:
-        """Verify the integrity of the entire hash chain.
+        """验证整个哈希链的完整性。
 
-        Verification algorithm:
-          1. Open a separate read-only connection (avoids locking the
-             main connection used by ``append()``).
-          2. Iterate rows in ``id`` ascending order.
-          3. For each row:
-             a. Check that ``prev_span_hash`` matches the previous row's
-                ``row_hash`` (or ``_GENESIS_HASH`` for the first row).
-             b. Recompute ``row_hash`` by re-building the content string
-                from the row's fields and re-hashing with SHA-256.
-             c. Compare the recomputed hash against the stored
-                ``row_hash``.
-          4. If any check fails, return False.
-          5. If all rows pass, return True.
+        验证算法：
+          1. 打开独立的只读连接（避免锁定 ``append()`` 使用的主连接）。
+          2. 按 ``id`` 升序遍历行。
+          3. 对每行：
+             a. 检查 ``prev_span_hash`` 是否匹配前一行的 ``row_hash``
+                （第一行匹配 ``_GENESIS_HASH``）。
+             b. 通过从行字段重建内容字符串并重新进行 SHA-256 哈希，
+                重新计算 ``row_hash``。
+             c. 比较重新计算的哈希与存储的 ``row_hash``。
+          4. 如有任何检查失败，返回 False。
+          5. 所有行通过则返回 True。
 
-        This detects:
-          - Direct UPDATE/DELETE of any row (the stored hash won't match).
-          - Truncation of trailing rows (prev_span_hash chain breaks).
-          - Bit-rot or partial file corruption (hash mismatch).
+        这可以检测：
+          - 对任一行直接 UPDATE/DELETE（存储的哈希不匹配）。
+          - 截断尾部行（prev_span_hash 链断裂）。
+          - 位衰减或部分文件损坏（哈希不匹配）。
 
-        What it does NOT detect:
-          - Tampering that re-hashes every row after modification
-            (requires the external Merkle root anchor to detect).
-          - File-level replacement (restoring an old copy of the DB).
+        不能检测的：
+          - 修改后重新哈希所有行的篡改（需要外部默克尔根锚点来检测）。
+          - 文件级替换（恢复数据库的旧副本）。
 
-        Args:
-          db_path: Database file to verify. Defaults to the active file.
+        参数:
+          db_path: 待验证的数据库文件。默认为当前活动文件。
 
-        Returns:
-          True if the entire chain is intact, False otherwise.
+        返回值:
+          整个链完好无损时返回 True，否则返回 False。
         """
         target = db_path or self._db_path
         if not os.path.isfile(target):
@@ -450,11 +427,11 @@ class AuditLedger:
 
             expected_prev = _GENESIS_HASH
             for row in rows:
-                # Check chain linkage
+                # 检查链链接
                 if row["prev_span_hash"] != expected_prev:
                     return False
 
-                # Recompute row_hash
+                # 重新计算 row_hash
                 content = self._build_content_string(
                     session_id=row["session_id"],
                     span_id=row["span_id"],
@@ -486,14 +463,14 @@ class AuditLedger:
     def verify_chain_report(
         self, db_path: Optional[str] = None
     ) -> Dict[str, Any]:
-        """Return a detailed verification report instead of a bool.
+        """返回详细的验证报告而非布尔值。
 
-        Useful for diagnostics and monitoring dashboards.
+        适用于诊断和监控仪表板。
 
-        Returns:
-          A dict with keys: ``valid`` (bool), ``total_rows`` (int),
-          ``first_bad_row_id`` (int or None), ``last_good_row_id``
-          (int or None).
+        返回值:
+          包含以下键值的字典：``valid``（布尔值）、``total_rows``（整数）、
+          ``first_bad_row_id``（整数或 None）、``last_good_row_id``
+          （整数或 None）。
         """
         target = db_path or self._db_path
         report: Dict[str, Any] = {
@@ -556,31 +533,28 @@ class AuditLedger:
         finally:
             conn.close()
 
-    # ── Merkle root export ─────────────────────────────────────────────
+    # ── 默克尔根导出 ─────────────────────────────────────────────────────
 
     def export_daily_merkle_root(self, date_str: str) -> Optional[str]:
-        """Compute a Merkle root for all rows on a given date.
+        """计算指定日期所有行的默克尔根。
 
-        The Merkle tree is built from the ordered list of ``row_hash``
-        values for that day. If the number of leaves is odd, the last
-        leaf is duplicated (the "balanced Merkle tree" convention used
-        by Bitcoin and most audit systems).
+        默克尔树从该日 ``row_hash`` 值的有序列表构建。
+        如果叶子数为奇数，最后一片叶子复制一份（"平衡默克尔树"
+        约定，比特币和大多数审计系统均采用此约定）。
 
-        Why Merkle roots?
-          The root can be published externally (e.g. to a blockchain,
-          DNS TXT record, or transparency log) as an anchor point.
-          Anyone who knows the root at time T can later verify that a
-          specific set of rows existed without alteration at that time
-          — without revealing the full dataset.  Combined with the hash
-          chain, this provides both internal consistency (chain) and
-          external anchoring (Merkle root).
+        为什么需要默克尔根？
+          根可以发布到外部（例如区块链、DNS TXT 记录或透明度日志）
+          作为锚点。知道时间 T 的根的任何人都能验证特定行集在
+          该时间是否存在且未被篡改——而无需暴露完整数据集。
+          结合哈希链，这同时提供了内部一致性（链）和外部锚定
+          （默克尔根）。
 
-        Args:
-          date_str: ISO 8601 date string (``"2026-06-21"``). Rows are
-            matched by prefix on ``created_at``.
+        参数:
+          date_str: ISO 8601 日期字符串（``"2026-06-21"``）。
+            按 ``created_at`` 前缀匹配行。
 
-        Returns:
-          Merkle root hex digest, or None if no rows exist for that date.
+        返回值:
+          默克尔根十六进制摘要，如果该日期无行记录则返回 None。
         """
         conn = self.connect()
         cursor = conn.execute(
@@ -597,30 +571,29 @@ class AuditLedger:
 
     @staticmethod
     def _merkle_root(leaves: List[str]) -> str:
-        """Compute SHA-256 Merkle root from an ordered list of leaf hashes.
+        """从有序的叶子哈希列表计算 SHA-256 默克尔根。
 
-        Algorithm (bottom-up binary Merkle tree):
-          1. Start with the list of leaf hashes as the current level.
-          2. While there is more than one node at the current level:
-             a. Pair adjacent nodes (i, i+1).
-             b. For each pair, compute SHA-256(left_hash || right_hash).
-             c. If there is an odd node at the end, pair it with itself:
-                SHA-256(loner || loner).
-             d. The resulting hashes form the next level.
-          3. When only one node remains, that is the Merkle root.
+        算法（自底向上二叉树形默克尔树）：
+          1. 从叶子哈希列表开始作为当前层级。
+          2. 当当前层级多于一个节点时：
+             a. 配对相邻节点 (i, i+1)。
+             b. 对每对，计算 SHA-256(left_hash || right_hash)。
+             c. 如果末尾有奇数节点，将其与自身配对：
+                SHA-256(loner || loner)。
+             d. 结果哈希形成下一层级。
+          3. 当仅剩一个节点时，该节点即为默克尔根。
 
-        This is the standard "balanced binary Merkle tree" construction
-        used by Bitcoin (BIP-34), Certificate Transparency, and most
-        audit-log systems.  Duplicating the last odd node ensures the
-        tree is always a complete binary tree, which simplifies
-        verification and proof generation.
+        这是标准的"平衡二叉默克尔树"构造，由 Bitcoin (BIP-34)、
+        Certificate Transparency 和大多数审计日志系统使用。
+        复制最后一个奇数节点确保树始终是完全二叉树，
+        简化了验证和证明生成。
 
-        Args:
-          leaves: Ordered list of SHA-256 hex digests (the leaf nodes).
+        参数:
+          leaves: SHA-256 十六进制摘要的有序列表（叶子节点）。
 
-        Returns:
-          Merkle root as a SHA-256 hex digest (64 characters).
-          Returns SHA-256("") if the list is empty.
+        返回值:
+          SHA-256 十六进制摘要形式的默克尔根（64 个字符）。
+          如果列表为空，返回 SHA-256("")。
         """
         if not leaves:
             return hashlib.sha256(b"").hexdigest()
@@ -630,10 +603,10 @@ class AuditLedger:
             next_level: List[str] = []
             for i in range(0, len(level), 2):
                 if i + 1 < len(level):
-                    # Standard pair: left || right
+                    # 标准配对：left || right
                     combined = level[i] + level[i + 1]
                 else:
-                    # Odd node: duplicate it (left || left)
+                    # 奇数节点：复制自身（left || left）
                     combined = level[i] + level[i]
                 next_level.append(
                     hashlib.sha256(combined.encode("utf-8")).hexdigest()
@@ -642,10 +615,10 @@ class AuditLedger:
 
         return level[0]
 
-    # ── Query helpers ──────────────────────────────────────────────────
+    # ── 查询辅助 ──────────────────────────────────────────────────
 
     def count(self) -> int:
-        """Return total number of records in the ledger."""
+        """返回账本中的记录总数。"""
         conn = self.connect()
         cursor = conn.execute("SELECT COUNT(*) FROM audit_ledger")
         return cursor.fetchone()[0]
@@ -656,17 +629,17 @@ class AuditLedger:
         event_type: Optional[str] = None,
         limit: int = 100,
     ) -> List[sqlite3.Row]:
-        """Query audit records with optional filters.
+        """查询审计记录，支持可选过滤条件。
 
-        Results are ordered by ``id`` ascending.
+        结果按 ``id`` 升序排列。
 
-        Args:
-          session_id: Filter by session ID (optional).
-          event_type: Filter by event type (optional).
-          limit: Maximum number of rows to return. Default 100.
+        参数:
+          session_id: 按会话 ID 过滤（可选）。
+          event_type: 按事件类型过滤（可选）。
+          limit: 最大返回行数。默认 100。
 
-        Returns:
-          List of sqlite3.Row objects.
+        返回值:
+          sqlite3.Row 对象列表。
         """
         conn = self.connect()
         where_clauses: List[str] = []
@@ -690,30 +663,28 @@ class AuditLedger:
         )
         return cursor.fetchall()
 
-    # ── File rotation ──────────────────────────────────────────────────
+    # ── 文件轮转 ──────────────────────────────────────────────────
 
     def _maybe_rotate(self) -> None:
-        """Check file size and rotate if exceeding the 10 MB threshold.
+        """检查文件大小，超过 10 MB 阈值时执行轮转。
 
-        Rotation policy:
-          When the active DB exceeds ``_ROTATION_MAX_BYTES`` (10 MB):
-            1. Close the current connection (if open).
-            2. Cascade: ``agent_audit.db`` -> ``agent_audit.db.1``,
-               ``.1`` -> ``.2``, ``.2`` -> ``.3``.
-            3. Remove ``.3`` if it exists (keep count = 3).
-            4. Reopen a fresh ``agent_audit.db``.
+        轮转策略：
+          当活动数据库超过 ``_ROTATION_MAX_BYTES``（10 MB）时：
+            1. 关闭当前连接（如果已打开）。
+            2. 级联重命名：``agent_audit.db`` -> ``agent_audit.db.1``，
+               ``.1`` -> ``.2``、``.2`` -> ``.3``。
+            3. 如果 ``.3`` 存在则删除（保留数量 = 3）。
+            4. 重新打开新的 ``agent_audit.db``。
 
-        Retention rationale:
-          - 3 rotated files at 10 MB each = 40 MB max on disk (30 MB
-            rotated + 10 MB active).  This is a reasonable bound for
-            ephemeral agent logs.
-          - The hash chain does NOT span rotated files — each file is
-            an independent chain.  ``verify_chain()`` operates on one
-            file at a time.  Cross-file continuity is not required
-            because the ledger is designed for per-session or per-day
-            audit trails, not unbounded append-only growth.
-          - Rotation is checked after EVERY append, so a burst of
-            writes that crosses the threshold triggers prompt rotation.
+        保留策略说明：
+          - 3 个轮转文件各 10 MB = 磁盘上最多 40 MB（30 MB 轮转
+            + 10 MB 活动）。这是临时性 Agent 日志的合理上限。
+          - 哈希链不会跨越轮转文件——每个文件是独立的链。
+            ``verify_chain()`` 一次操作一个文件。不需要跨文件连续性，
+            因为账本设计用于按会话或按日审计追踪，而非无限制的
+            仅追加增长。
+          - 每次追加后都检查轮转，因此跨过阈值的写入爆发会触发
+            及时轮转。
         """
         if not os.path.isfile(self._db_path):
             return
@@ -721,17 +692,17 @@ class AuditLedger:
         try:
             size = os.path.getsize(self._db_path)
         except OSError:
-            return  # file vanished — skip rotation
+            return  # 文件消失——跳过轮转
 
         if size < _ROTATION_MAX_BYTES:
             return
 
-        # Close current connection before rotating
+        # 轮转前关闭当前连接
         was_open = self._conn is not None
         if was_open:
             self.close()
 
-        # Cascade: shift existing backups down (3 -> delete, 2 -> 3, 1 -> 2)
+        # 级联：将现有备份依次下移（3 -> 删除, 2 -> 3, 1 -> 2）
         for i in range(_ROTATION_KEEP, 0, -1):
             src = f"{self._db_path}.{i - 1}" if i > 1 else self._db_path
             dst = f"{self._db_path}.{i}"
@@ -740,21 +711,20 @@ class AuditLedger:
                     os.remove(dst)
                 shutil.move(src, dst)
 
-        # Delete the oldest file if it exceeds the keep count
+        # 删除超出保留数量的最旧文件
         oldest = f"{self._db_path}.{_ROTATION_KEEP}"
         if os.path.isfile(oldest):
             os.remove(oldest)
 
-        # Reopen fresh database if it was open before
+        # 如果之前已打开，重新打开新数据库
         if was_open:
             self.connect()
 
     def list_rotated_files(self) -> List[str]:
-        """Return paths of all rotated database files.
+        """返回所有轮转数据库文件的路径。
 
-        Returns:
-          Sorted list of absolute paths to existing rotated files,
-          newest first.
+        返回值:
+          现有轮转文件绝对路径的排序列表，最新优先。
         """
         pattern = f"{self._db_path}."
         candidates = [

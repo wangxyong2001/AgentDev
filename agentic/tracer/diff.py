@@ -1,62 +1,55 @@
 """
-Cross-turn Diff Algorithm — pure functions for prompt comparison and cache estimation.
+跨轮 Diff 算法 — 用于提示词比较和缓存估计的纯函数。
 
-Key algorithms:
-  - decompose_prompt: split ReAct prompt into system/user/history segments
-  - compute_diff:      character-level common-prefix comparison between turns
-  - estimate_cache:    token-level KV-cache hit rate estimation (3.5 char/token)
+功能描述:
+  核心算法:
+    - decompose_prompt: 将 ReAct 提示词拆分为 system/user/history 三个片段
+    - compute_diff:      轮次间的字符级公共前缀比较
+    - estimate_cache:    token 级别的 KV-cache 命中率估算（3.5 字符/token）
 
-Stateless — no side effects, no global state. Independently testable.
-
-========================
-Character-level Common Prefix Algorithm
-========================
-
-The diff algorithm finds the longest common prefix between two consecutive
-prompts by character-by-character comparison. Complexity is O(min(N, M))
-where N and M are the lengths of the two prompts.
-
-Why character-level instead of token-level?
-  - Tokenisation is model-dependent (different models use different
-    tokenisers). Character-level comparison is model-agnostic.
-  - We use characters as a proxy for token positions because the KV-cache
-    operates on token positions, and the common prefix in characters maps
-    (roughly) to the common prefix in tokens.
-  - The trade-off: character-level comparison is O(N) while a smarter
-    algorithm (e.g. binary search on hashed prefixes) could be O(log N),
-    but the prompts are typically <10K chars so O(N) is fine.
-
-Performance note:
-  For a 10,000-char prompt and 8 reasoning turns, this loop runs at most
-  80,000 comparisons per session — negligible overhead.
+  无状态 — 无副作用，无全局状态。可独立测试。
 
 ========================
-3.5 chars/token Heuristic
+字符级公共前缀算法
 ========================
 
-We use 3.5 characters per token for cache estimation. This is an empirical
-average for mixed Chinese (CN) and English (EN) text, which is the primary
-use case for this agent (Chinese-speaking users asking questions, English
-tool names and code, mixed-language reasoning).
+  diff 算法通过逐字符比较来找到两个连续提示词之间的最长公共前缀。
+  复杂度为 O(min(N, M))，其中 N 和 M 是两个提示词的长度。
 
-Justification:
-  - English text averages ~4 chars/token (OpenAI's rule of thumb: ~0.75
-    tokens/word at ~5 chars/word = ~3.75 chars/token).
-  - Chinese text averages ~1.5 chars/token (each Chinese character is a
-    single Unicode codepoint, and tokenisers typically encode 1-2 Chinese
-    characters per token).
-  - For mixed CN/EN text (our target use case), the empirical average
-    lands near 3.5 chars/token based on measurements across ReAct prompts
-    with ~60% English structure + ~40% Chinese content.
-  - Accuracy: approximately +/- 5% for cost estimation purposes. This is
-    sufficient for cache hit rate analysis (we only need relative magnitude,
-    not exact token counts).
+  为什么用字符级而不是 token 级？
+    - Token 化是模型相关的（不同模型使用不同的 tokeniser）。
+      字符级比较是模型无关的。
+    - 我们使用字符作为 token 位置的代理，因为 KV-cache 按 token 位置操作，
+      字符级的公共前缀（大致）映射到 token 级的公共前缀。
+    - 权衡：字符级比较是 O(N)，而更智能的算法（如在哈希前缀上二分搜索）
+      可以达到 O(log N)，但提示词通常 <10K 字符，因此 O(N) 足够。
 
-Update this value if:
-  - The target model changes to one with a very different tokeniser
-    (e.g. Llama 3's tokeniser has different CN/EN ratios than Qwen2's).
-  - Empirical measurements across a production trace dataset show
-    systematic bias beyond +/- 5%.
+  性能说明:
+    对于 10,000 字符的提示词和 8 轮推理，此循环每轮最多运行
+    80,000 次比较 — 开销可忽略不计。
+
+========================
+3.5 字符/token 启发式值
+========================
+
+  我们使用 3.5 字符每 token 进行缓存估算。这是中英文混合文本的
+  经验平均值，是该 Agent 的主要使用场景（中文用户提问、
+  英文工具名和代码、中英文混合推理）。
+
+  理由:
+    - 英文文本平均 ~4 字符/token（OpenAI 经验法则：~0.75 token/词，
+      约 5 字符/词 = ~3.75 字符/token）。
+    - 中文文本平均 ~1.5 字符/token（每个中文字符是一个 Unicode 码点，
+      tokeniser 通常每 token 编码 1-2 个中文字符）。
+    - 对于中英文混合文本（我们的目标场景），根据对约 60% 英文结构 +
+      ~40% 中文内容的 ReAct 提示词的测量，经验平均值接近 3.5 字符/token。
+    - 精度：对于成本估算目的约为 +/- 5%。这对于缓存命中率分析足够
+      （我们只需要相对幅度，而非精确 token 数）。
+
+  更新此值的时机:
+    - 目标模型更换为使用非常不同的 tokeniser 时
+      （例如 Llama 3 的 tokeniser 与 Qwen2 的中英文比例不同）。
+    - 基于生产 trace 数据集的经验测量显示系统偏差超过 +/- 5%。
 """
 
 from __future__ import annotations
@@ -67,21 +60,23 @@ from typing import Optional
 
 
 # ==========================================================================
-# Data types
+# 数据类型
 # ==========================================================================
 
 @dataclass
 class PromptDecomposition:
     """
-    ReAct prompt decomposed into three segments.
+    ReAct 提示词分解为三个片段。
 
-    Segments:
-      system_prompt: Fixed ReAct rules + tool definitions (KV-cache best friend)
-      user_message:  User question or Observation injection (varies per turn)
-      history_text:  Accumulated Thought/Action/Observation records (grows each turn)
-      full_prompt:    Original complete prompt (raw input)
+    功能描述:
+      将完整提示词拆分为三个角色特定部分。
+
+    片段:
+      system_prompt: 固定的 ReAct 规则 + 工具定义（KV-cache 的最佳朋友）
+      user_message:  用户问题或 Observation 注入（每轮变化）
+      history_text:  累积的 Thought/Action/Observation 记录（每轮增长）
+      full_prompt:    原始的完整提示词（原始输入）
     """
-
     system_prompt: str
     user_message: str
     history_text: str
@@ -89,31 +84,34 @@ class PromptDecomposition:
 
     @property
     def system_len(self) -> int:
-        """Character length of system prompt (should remain constant).
+        """
+        系统提示词的字符长度（应保持恒定）。
 
-        Under normal operation, this value should never change between
-        turns. If it does, either the YAML protocol was reloaded or
-        something is corrupting the system prompt mid-session — both
-        are anomalous conditions worth investigating.
+        功能描述:
+          正常操作下，此值在轮次之间应永不改变。
+          如果变化，要么是 YAML 协议被重新加载，要么是系统提示词
+          在会话中途被破坏 — 两者都是值得调查的异常情况。
         """
         return len(self.system_prompt)
 
     @property
     def user_len(self) -> int:
-        """Character length of user message.
+        """
+        用户消息的字符长度。
 
-        Changes each turn if the user asks a follow-up question, or
-        stays the same if only the history is growing (multi-step
-        reasoning on the same question).
+        功能描述:
+          如果用户提出后续问题则每轮变化，
+          如果仅有历史记录增长则保持不变（同一问题上的多步推理）。
         """
         return len(self.user_message)
 
     @property
     def history_len(self) -> int:
-        """Character length of history (grows each turn).
+        """
+        历史记录字符长度（每轮增长）。
 
-        Monotonically increasing function of turn count (unless
-        truncation or summarisation is applied).
+        功能描述:
+          轮次数的单调递增函数（除非应用截断或摘要）。
         """
         return len(self.history_text)
 
@@ -121,22 +119,39 @@ class PromptDecomposition:
 @dataclass
 class TurnDiff:
     """
-    Full cross-turn difference analysis.
+    完整的跨轮差异分析。
 
-    Dimensions:
+    功能描述:
+      从四个维度描述两个连续 ReAct 轮次之间的差异。
+
+    维度:
       Prompt:   common_prefix_len, reuse_pct, system_unchanged, history_lines_added
       Response: thought_vs_prev, action_vs_prev, response_len_delta
       Cache:    estimated cached_tokens, new_tokens
 
-    The 13 dimensions are designed to capture every observable property
-    of the transition between two ReAct turns. They serve dual purposes:
-      1. Real-time metrics (logged per turn via logger.diff)
-      2. Post-hoc analysis (aggregated by TraceCollector.summary)
-    """
+    13 个维度旨在捕获两个 ReAct 轮次之间转换的每个可观察属性。
+    它们具有双重用途:
+      1. 实时指标（每轮通过 logger.diff 记录）
+      2. 事后分析（由 TraceCollector.summary 聚合）
 
+    参数:
+      turn: 当前轮次号
+      common_prefix_len: 与前一轮的公共前缀字符长度
+      new_prompt_len: 当前轮次独有的新字符长度
+      prompt_reuse_pct: 提示词复用百分比
+      system_unchanged: 系统提示词是否未变
+      history_lines_added: 新增的历史记录行数
+      user_changed: 用户消息是否变化
+      thought_vs_prev: "new" | "same" | "different"
+      action_vs_prev: "new" | "same" | "different"
+      response_len_delta: 与上一轮相比的响应长度变化
+      cached_tokens: 估计的缓存 token 数（可复用部分）
+      new_tokens: 估计的新 token 数
+      summary_line: 一行摘要字符串
+    """
     turn: int
 
-    # Prompt dimensions
+    # Prompt 维度
     common_prefix_len: int
     new_prompt_len: int
     prompt_reuse_pct: float
@@ -144,44 +159,42 @@ class TurnDiff:
     history_lines_added: int
     user_changed: bool
 
-    # Response dimensions
+    # Response 维度
     thought_vs_prev: str  # "new" | "same" | "different"
     action_vs_prev: str   # "new" | "same" | "different"
     response_len_delta: int
 
-    # Cache estimation
+    # 缓存估算
     cached_tokens: int
     new_tokens: int
 
-    # One-line summary
+    # 一行摘要
     summary_line: str
 
 
 # ==========================================================================
-# Prompt decomposition
+# 提示词分解
 # ==========================================================================
 
-# Separator patterns for chat templates.
+# Chat 模板的分隔符模式。
 #
-# MAINTENANCE NOTE:
-# When adding support for a new model's chat template, add a new entry
-# here with the appropriate regex patterns. The keys must match the
-# `chat_format` parameter in decompose_prompt().
+# 维护说明:
+# 当为新模型的 chat 模板添加支持时，在此处添加新的条目并
+# 包含适当的正则模式。键名必须与 decompose_prompt() 中的
+# `chat_format` 参数匹配。
 #
-# Each format needs three patterns:
-#   - system:  captures the system prompt between delimiters
-#   - user:    captures the user message between delimiters
-#   - assistant: captures everything after the assistant header (no
-#     closing delimiter — the assistant section is open-ended by design
-#     to let the model continue generating)
+# 每个格式需要三个模式:
+#   - system:    捕获分隔符之间的系统提示词
+#   - user:      捕获分隔符之间的用户消息
+#   - assistant: 捕获 assistant 头部之后的所有内容（无结束分隔符 —
+#     assistant 部分有意开放，以允许模型继续生成）
 #
-# Current supported formats:
-#   "qwen2":  <|im_start|>role\n...<|im_end|>  (ChatML variant)
+# 当前支持的格式:
+#   "qwen2":  <|im_start|>role\n...<|im_end|>  (ChatML 变体)
 #   "llama3": <|begin_of_text|><|start_header_id|>role<|end_header_id|>\n\n...<|eot_id|>
 #
-# TEST AFTER ADDING: every new pattern must be tested against a real
-# full-prompt sample from the target model. The regex DOTALL flag is
-# required because prompts can span multiple lines.
+# 添加后必须测试: 每个新模式必须使用目标模型的实际完整提示词样本
+# 进行测试。由于提示词可以跨多行，需要正则 DOTALL 标志。
 _SEPARATORS = {
     "qwen2": {
         "system": r'<\|im_start\|>system\n(.*?)<\|im_end\|>',
@@ -198,22 +211,22 @@ _SEPARATORS = {
 
 def decompose_prompt(prompt: str, chat_format: str = "qwen2") -> PromptDecomposition:
     """
-    Decompose a ReAct prompt into system/user/history segments.
+    将 ReAct 提示词分解为 system/user/history 片段。
 
-    Uses regex to extract the three role-specific sections from a
-    fully-assembled prompt string. The regex patterns are model-specific
-    (see _SEPARATORS).
+    功能描述:
+      使用正则表达式从完整提示词字符串中提取三个角色特定部分。
+      正则模式是模型特定的（参见 _SEPARATORS）。
 
-    Args:
-      prompt:       Full ReAct prompt string
-      chat_format:  Chat template format ("qwen2" | "llama3")
+    参数:
+      prompt:       完整的 ReAct 提示词字符串
+      chat_format:  Chat 模板格式（"qwen2" | "llama3"）
 
-    Returns:
-      PromptDecomposition with three segments
+    返回:
+      包含三个片段的 PromptDecomposition
 
-    Note:
-      The assistant segment intentionally lacks a closing delimiter —
-      this is by design to let the model continue generating.
+    注意事项:
+      assistant 片段有意缺少结束分隔符 —
+      这是为了让模型可以继续生成而设计。
     """
     seps = _SEPARATORS.get(chat_format, _SEPARATORS["qwen2"])
 
@@ -242,7 +255,7 @@ def decompose_prompt(prompt: str, chat_format: str = "qwen2") -> PromptDecomposi
 
 
 # ==========================================================================
-# Cross-turn diff
+# 跨轮差异计算
 # ==========================================================================
 
 def compute_diff(
@@ -259,55 +272,63 @@ def compute_diff(
     prev_response_len: int,
 ) -> TurnDiff:
     """
-    Compute full cross-turn difference between two consecutive ReAct calls.
+    计算两个连续 ReAct 调用之间的完整跨轮差异。
 
-    Algorithm:
-      1. Character-by-character common prefix scan: O(min(len(a), len(b)))
-         — linearly compares the two prompts until the first difference.
-         This gives us the number of characters that can be served from
-         KV-cache on the next inference call.
+    功能描述:
+      从四个维度全面分析两个轮次之间的变化。
 
-      2. Cache token estimation: common_len / 3.5 (empirical CN/EN average)
-         — converts character-level reuse to approximate token-level cache
-         hit. The 3.5 divisor is an empirical average for mixed CN/EN text;
-         see module-level docstring for justification.
+    算法:
+      1. 逐字符公共前缀扫描: O(min(len(a), len(b)))
+         — 线性比较两个提示词，直到第一个差异处。
+         这给出了在下次推理调用中可从 KV-cache 提供的字符数。
 
-      3. System prompt anomaly detection: direct string comparison
-         — checks if the system prompt changed between turns. Any change
-         here is anomalous (system prompt should be static) and invalidates
-         the entire KV-cache for the prefix.
+      2. 缓存 token 估算: common_len / 3.5（中英文混合经验平均值）
+         — 将字符级复用转换为近似的 token 级缓存命中。
+         3.5 除数是对中英文混合文本的经验平均值；
+         见模块级文档字符串了解理由和精度范围。
 
-      4. Response semantic comparison: thought/action equality check
-         — classifies the response as "same" (exact repeat), "new" (first
-         occurrence), or "different" (changed from previous turn).
+      3. 系统提示词异常检测: 直接字符串比较
+         — 检查系统提示词在轮次之间是否变化。任何变化都是异常的
+         （系统提示词应是静态的），并使整个前缀的 KV-cache 失效。
 
-    Args:
-      turn:              Current turn number
-      current_prompt:    This turn's full prompt
-      prev_prompt:       Last turn's full prompt (empty for first turn)
-      decomp:            This turn's prompt decomposition
-      prev_decomp:       Last turn's decomposition (None for first turn)
-      thought:           This turn's parsed Thought
-      prev_thought:      Last turn's Thought
-      action:            This turn's parsed Action
-      prev_action:       Last turn's Action
-      response_len:      This turn's cleaned output char length
-      prev_response_len: Last turn's cleaned output char length
+      4. 响应语义比较: thought/action 相等性检查
+         — 将响应分类为 "same"（完全重复）、"new"（首次出现）
+         或 "different"（与上一轮不同）。
 
-    Returns:
-      TurnDiff with all 13 dimensions populated
+    参数:
+      turn:              当前轮次号
+      current_prompt:    本轮次的完整提示词
+      prev_prompt:       上一轮的完整提示词（第一轮为空字符串）
+      decomp:            本轮次的提示词分解
+      prev_decomp:       上一轮的提示词分解（第一轮为 None）
+      thought:           本轮次解析的 Thought
+      prev_thought:      上一轮的 Thought
+      action:            本轮次解析的 Action
+      prev_action:       上一轮的 Action
+      response_len:      本轮次清理后输出的字符长度
+      prev_response_len: 上一轮清理后输出的字符长度
+
+    返回:
+      包含所有 13 个维度的 TurnDiff
+
+    处理逻辑:
+      1. 计算字符级公共前缀（用于 KV-cache 估计）
+      2. 检测系统提示词是否变化（金丝雀指标）
+      3. 测量历史记录增长
+      4. 检测用户消息是否变化
+      5. 比较响应的语义变化
+      6. 估算缓存 token 数
+      7. 生成一行摘要
     """
 
-    # ═══ Prompt dimension: character-level common prefix ═══
-    # Scan forward character by character until we find a difference.
-    # This gives us the longest prefix shared by both prompts.
+    # ═══ Prompt 维度: 字符级公共前缀 ═══
+    # 逐字符向前扫描，直到发现差异。
+    # 这给出了两个提示词共享的最长前缀。
     #
-    # Why not use difflib.SequenceMatcher?
-    #   SequenceMatcher.find_longest_match() finds the longest common
-    #   SUBSTRING anywhere in both strings, not just the prefix. For
-    #   KV-cache estimation, we only care about the PREFIX — the cache
-    #   is invalidated from the first point of difference onward, even
-    #   if identical text appears later.
+    # 为什么不用 difflib.SequenceMatcher?
+    #   SequenceMatcher.find_longest_match() 找到两个字符串中任意位置的
+    #   最长公共子串，而不仅仅是前缀。对于 KV-cache 估算，我们只关心
+    #   前缀 — 缓存从第一个差异点开始就失效了，即使后面出现相同文本。
     common_len = 0
     min_len = min(len(current_prompt), len(prev_prompt)) if prev_prompt else 0
     for i in range(min_len):
@@ -319,76 +340,74 @@ def compute_diff(
     new_len = len(current_prompt) - common_len
     reuse_pct = (common_len / len(current_prompt) * 100) if len(current_prompt) > 0 else 0.0
 
-    # System prompt anomaly detection (canary metric).
+    # 系统提示词异常检测（金丝雀指标）。
     #
-    # Under normal operation, the system prompt should NEVER change
-    # between turns. If it does, every prior KV-cache entry is invalid
-    # and the model must reprocess the entire prompt.
+    # 正常操作下，系统提示词在轮次之间应永不改变。
+    # 如果变化，之前的每个 KV-cache 条目都失效，
+    # 模型必须重新处理整个提示词。
     #
-    # This check serves as a CANARY METRIC — like a canary in a coal
-    # mine, an unexpected system prompt change signals a serious problem:
-    #   - The YAML protocol was reloaded mid-session
-    #   - A concurrent thread or process modified the config
-    #   - A memory corruption bug in the template renderer
-    #   - An attacker injected content that pushed into the system
-    #     prompt section (unlikely but possible in a prompt injection
-    #     scenario where the chat template delimiters failed)
+    # 此检查作为金丝雀指标 — 如同煤矿中的金丝雀，
+    # 意外的系统提示词变化信号表示严重问题:
+    #   - YAML 协议在会话中途被重新加载
+    #   - 并发线程或进程修改了配置
+    #   - 模板渲染器中的内存损坏 bug
+    #   - 攻击者注入内容进入了系统提示词部分
+    #     （不太可能，但在 chat 模板分隔符失效的提示注入场景中可能发生）
     #
-    # In a healthy session, system_change_count (in collector.py) should
-    # always be 0. Any non-zero value triggers an alert.
+    # 在健康会话中，system_change_count（在 collector.py 中）应始终为 0。
+    # 任何非零值都会触发告警。
     system_unchanged = True
     if prev_decomp and decomp:
         system_unchanged = (prev_decomp.system_prompt == decomp.system_prompt)
 
-    # History growth measurement.
-    # History grows monotonically — each turn adds one more entry.
-    # Counting newlines is a cheap approximation of "how many new
-    # history entries were added" (each entry is one Thought/Action/
-    # Action Input/Observation block, separated by newlines).
+    # 历史记录增长测量。
+    # 历史记录单调增长 — 每轮增加一个条目。
+    # 计算换行符是一种廉价的近似方法，表示"新增了多少个历史记录条目"
+    # （每个条目是一个 Thought/Action/Action Input/Observation 块，
+    # 由换行符分隔）。
     history_added = 0
     if prev_decomp and decomp:
         prev_lines = prev_decomp.history_text.count('\n')
         curr_lines = decomp.history_text.count('\n')
         history_added = max(0, curr_lines - prev_lines)
 
-    # User message change detection.
-    # In a single-turn interaction (the user asks one question and the
-    # agent solves it in multiple steps), the user message is constant.
-    # If it changes, the user asked a follow-up or clarified.
+    # 用户消息变化检测。
+    # 在单轮交互中（用户问一个问题，Agent 多步解决），
+    # 用户消息是恒定的。如果变化，是用户提出了后续问题或澄清。
     user_changed = True
     if prev_decomp and decomp:
         user_changed = (prev_decomp.user_message != decomp.user_message)
 
-    # ═══ Response dimension: semantic comparison ═══
-    # Classify how the model's output changed from the previous turn:
-    #   "new"        — first turn or no previous response
-    #   "same"       — identical thought/action (could indicate
-    #                  perseveration or the model re-stating the same step)
-    #   "different"  — changed from previous (normal operation)
+    # ═══ Response 维度: 语义比较 ═══
+    # 将模型输出从上一轮的变化分类:
+    #   "new"        — 第一轮或没有上一轮的响应
+    #   "same"       — 相同的 thought/action（可能表示
+    #                  持续失败或模型重复相同的步骤）
+    #   "different"  — 与上一轮不同（正常操作）
     thought_vs = "new" if not prev_thought else (
         "same" if thought == prev_thought else "different")
     action_vs = "new" if not prev_action else (
         "same" if action == prev_action else "different")
     resp_delta = response_len - prev_response_len if prev_response_len else response_len
 
-    # ═══ Cache dimension: token estimation ═══
-    # Convert character-level common prefix to token-level cache estimate.
-    # 3.5 chars/token is empirical for CN/EN mixed text.
-    # See module-level docstring for justification and accuracy bounds.
+    # ═══ Cache 维度: token 估算 ═══
+    # 将字符级公共前缀转换为 token 级缓存估算。
+    # 3.5 字符/token 是针对中英文混合文本的经验平均值。
+    # 见模块级文档字符串了解理由和精度边界。
     cached_tokens = int(common_len / 3.5)
     new_token_est = int(new_len / 3.5)
 
-    # ═══ One-line summary ═══
-    # Compact human-readable summary for per-turn logging.
-    # Format matches the logger.diff() convention in TraceCollector.
-    parts = [f"reuse {reuse_pct:.0f}%"]
+    # ═══ 一行摘要 ═══
+    # 紧凑的人类可读摘要，用于每轮日志记录。
+    # 格式匹配 TraceCollector 中 logger.diff() 的约定。
+    parts = [f"复用率 {reuse_pct:.0f}%"]
     if history_added > 0:
-        parts.append(f"history +{history_added} lines")
-    parts.append(f"user {'changed' if user_changed else 'same'}")
+        parts.append(f"历史 +{history_added} 行")
+    parts.append(f"用户 {'变化' if user_changed else '不变'}")
     parts.append(f"Thought:{thought_vs}")
     parts.append(f"Action:{action_vs}")
     if resp_delta != 0:
-        parts.append(f"resp {resp_delta:+d} chars")
+        parts.append(f"响应 {resp_delta:+d} 字符")
 
     return TurnDiff(
         turn=turn,
