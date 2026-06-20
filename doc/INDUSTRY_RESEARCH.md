@@ -1,8 +1,8 @@
 # AI Agent 开发行业最佳实践调研报告
 
-> 文档版本: v1.4 | 调研日期: 2026-06-21 | 作者: AI Agent 架构组
+> 文档版本: v1.5 | 调研日期: 2026-06-21 | 作者: AI Agent 架构组
 > 机密级别: 内部
-> 调研范围: LangChain 1.0、OpenAI Agents SDK、Anthropic Claude Agent 三⼤⽣态 + 沙箱安全 + 基础设施 + 边界划定 + 四⼤⼯程学科 (Prompt/Context/Harness/Loop)
+> 调研范围: 三⼤⽣态 + 沙箱安全 + 基础设施 + 边界划定 + 四⼤⼯程学科 + 评估·监测·审计方法论
 
 ---
 
@@ -1315,7 +1315,263 @@ Gartner 预测 40% Agentic 项⽬将在 2027 年前因经济原因被废弃（�
 
 ---
 
-## 11. 架构演进路线图
+## 11. Agent 评估·监测·审计方法论（专题调研）
+
+> ⚠️ **核心观点**: Agent 不是模型。Agent 的评估单元不是 `(input, output)`，而是**轨迹 (Trajectory)**——从系统提示词到最终结果的完整执行序列。监测回答"哪里出问题了？"，审计回答"谁做的、何时做的、怎么做的、能证明吗？"。
+
+### 11.1 Agent 评估指标体系
+
+#### 11.1.1 根本转变：轨迹 ≠ LLM 输出
+
+> "An agent is not a model. Evaluating one as if it were is the most common reason production agents fail. The unit is the trajectory." — FutureAGI (2026)
+
+**数学本质（复合误差）**:
+
+```
+端到端成功率 ≈ ∏(每步成功率)
+
+8 步 Agent, 每步 95% → 0.95⁸ ≈ 66% 端到端
+8 步 Agent, 每步 99% → 0.99⁸ ≈ 92% 端到端
+```
+
+**三分之二的会话在每步评分全绿的情况下端到端失败——这是复合误差的默认数学。**
+
+#### 11.1.2 六维评估量规（行业标准）
+
+| 维度 | 衡量内容 | 缺失时的失败模式 |
+|------|---------|----------------|
+| **Tool Selection** | 工具选择是否正确，或正确选择"不调用工具" | 错选工具、捏造工具、该调用时未调用 |
+| **Argument Extraction** | 参数是否符合 Schema 且语义正确 | 工具对但日期格式错、缺少必填字段 |
+| **Result Utilization** | 是否使用工具返回结果，还是用模型知识替代 | 数值翻转、实体替换、结果被忽略 |
+| **Error Recovery** | 工具失败时是否重试、降级或升级 | 崩溃、幻觉成功、用相同错误输入重试 |
+| **Plan Coherence** | 无循环、无死胡同、深度适当 | 子树爆炸、过早终止、无限循环 |
+| **Task Completion** | 轨迹是否端到端完成用户目标 | 每步绿灯，端到端失败 |
+
+**关键规则**: 聚合任务完成率单独使用会**隐藏**哪个维度在退化。六维度独立评分告诉你今天下午该修什么。
+
+#### 11.1.3 Trajectory Score（复合指标）
+
+| 组件 | 默认权重 | 衡量内容 |
+|------|---------|---------|
+| Task Completion | 40% | 目标是否达成？ |
+| Step Efficiency | 30% | 步数是否合理？ |
+| Tool Selection Accuracy | 30% | 是否选对工具？ |
+
+扩展版（4-D）增加：事实基础、隐私安全、指令遵循、最优计划执行（各 1-5 分）。
+
+#### 11.1.4 三种评估框架（不同节奏并行运行）
+
+| 框架 | 评分对象 | 运行时机 | 盲区 |
+|------|---------|---------|------|
+| **Trajectory-first** | 完整有序轨迹：工具选择、参数、计划、恢复、完成 | CI 每 PR | 遗漏最终回复的风格/语气退化 |
+| **Task-completion-first** (基准测试) | 公开数据集黑盒成功 | 模型选择、能力底线、供应商对比 | 对你的注册表、Schema、错误码一无所知 |
+| **Output-quality-first** (LLM Judge) | 最终回复对照量规 | 实时在线评分 | 干净回复可能来自破碎轨迹 |
+
+**混合模式**: CI 中跑 Trajectory 量规 → Live Span 上跑 Output-quality Judge → 模型选择时跑 Public Benchmark。
+
+#### 11.1.5 核心基准测试 (2025-2026)
+
+| 基准 | 测试内容 | 关键指标 | 2026 前沿水平 |
+|------|---------|---------|-------------|
+| **BFCL v3** (Berkeley) | 工具调用：AST 正确性、可执行性、无关检测 | Per-track F1 | 新增 irrelevance bucket |
+| **τ-bench** (Anthropic) | 多轮 Agent (航空/零售) | `pass^k` 跨 k 次 rollout | 强模型零售 pass⁸ < 25% |
+| **AgentBench** | 8 环境规划、工具使用、观察处理 | Task Success + TrajectoryScore | 广度检查 |
+| **SWE-Bench Verified** | 500 真实 GitHub Issues | 端到端成功率 | 前沿 60-70% |
+| **GAIA Level 3** | 多步推理 + 工具使用 | 任务成功 | 深度信号 |
+
+> **规则**: 公开基准测试告诉你模型**能否调用工具**。它们对你的注册表、参数 Schema、错误码、业务策略一无所知。**私有 Eval 集才是生产闸门**。
+
+#### 11.1.6 生产 CI 闸门 — 六维度独立阈值（非聚合）
+
+```
+assertions:
+  - tool_selection.score >= 0.95 for at_least 95% of cases
+  - argument_validation.score >= 0.90 for at_least 90%
+  - argument_semantics.score >= 0.85 for at_least 85%
+  - result_groundedness.score >= 0.90 for at_least 90%
+  - recovery_score.score >= 0.80 for at_least 85%
+  - task_completion.score >= 0.85 for at_least 90%
+```
+
+**为何不聚合**: 0.85 的聚合分可能隐藏 0.62 的参数提取分（在 0.97 的工具选择分后面）。生产失败就出在这个薄弱维度上。
+
+#### 11.1.7 生产常见错误
+
+| 错误 | 为什么危险 |
+|------|-----------|
+| **回复级评分** | 遗漏所有根因是工具调用/计划错误的失败 |
+| **仅聚合分** | 隐藏哪个维度退化 |
+| **无 irrelevance bucket** | 只评分"期待工具"的案例，过度调用退化不可见 |
+| **Mock 工具无错误恢复覆盖** | Happy-path 0.95 → 生产 429 风暴 0.30 |
+| **固定测试集** | 偏离产品演化，需每周从生产失败中提升新 case |
+| **LLM Judge 与 Agent 同模型家族** | 判官—工人串通，系统性地高估工人分数 |
+
+**数据来源**: [FutureAGI: Definitive Guide to AI Agent Evaluation (2026)](https://futureagi.com/blog/definitive-guide-ai-agent-evaluation-2026/), [Trajectory Score](https://futureagi.com/glossary/trajectory-score/), [BFCL v3](https://futureagi.com/glossary/agentbench/), [τ-bench](https://futureagi.com/glossary/trajectory-score/)
+
+---
+
+### 11.2 Agent 监测指标体系
+
+#### 11.2.1 Agent 监测的特殊性
+
+**监测 vs 可观测性**:
+
+| 维度 | 监测 (Monitoring) | 可观测性 (Observability) |
+|------|------------------|------------------------|
+| 问题 | "什么坏了？" | "为什么坏了？" |
+| 机制 | 已知指标 vs 阈值 | 关联指标+日志+追踪+事件 |
+| Agent 挑战 | Agent 以微妙方式失败（幻觉、跳步、上下文错误、无限循环），传统 uptime 监测看不到 |
+
+#### 11.2.2 生产监测指标矩阵
+
+| 层级 | 指标 | 告警阈值示例 |
+|------|------|------------|
+| **模型/输出** | 延迟 p50/p95/p99、Token 消耗、首 Token 时间 | p95 > 800ms |
+| **内容风险** | 幻觉率、毒性分数、偏见分数、注入检测触发率 | 幻觉率 > 5% |
+| **Agent 行为** | maxIterationBreachRate、ToolSelectionAccuracy、TrajectoryScore | Breach > 2% |
+| **可靠性** | 错误率、重试率、超时率、熔断触发率 | 错误率 > 1% |
+| **成本效率** | Token-per-trace、Cost-per-session、Cache hit rate | Cost > 基线 120% |
+| **业务结果** | 任务完成率、人工升级率、用户满意度 | Completion < 85% |
+
+#### 11.2.3 Honeycomb — Agent 可观测性标杆（Mar 2026）
+
+Honeycomb 2026 年 3 月发布 AI-Native Agent Observability Suite：
+
+- **Agent Timeline**: 将每个 LLM 调用、工具调用、Agent 交接、下游系统影响可视化为单一连贯 Trace
+- **Automated Investigations**: 告警触发或 SLO 燃烧时，AI 自主检测问题、按 SRE 剧本调查、推荐解决方案
+- **Agent Skills**: 为 Claude Code/Cursor/等 Agent 提供迁移传统遥测到 OpenTelemetry 的能力
+- **Pipeline Intelligence**: AI 驱动的遥测管道创建（天→分钟）
+- 基于 **OpenTelemetry GenAI 语义规范 v1.40.0**，`gen_ai.*` 属性为头等公民
+
+#### 11.2.4 SLO 优先方法（LogicMonitor, Nov 2025）
+
+```
+Step 1: 从最关键的 AI 驱动服务开始
+Step 2: 定义 SLO (p95 延迟 < 800ms, 任务完成率 > 90%)
+Step 3: 映射依赖关系
+Step 4: 建立基线
+Step 5: 扩展到其他服务
+```
+
+#### 11.2.5 可观测性的六个表面（FutureAGI 2026）
+
+| 表面 | 功能 |
+|------|------|
+| **Sessions** | 多轮对话重建 |
+| **User View** | 每用户聚合所有 traces/sessions |
+| **Evals on Traces** | 持续质量评分（幻觉、语调、偏见、毒性）|
+| **Dashboards** | 自定义 Widget，追踪错误率、延迟、Token、Eval 分 |
+| **Alerts & Monitors** | 基于阈值的通知（倒置仪表板模式）|
+| **Failure Clustering** | HDBSCAN 自动聚类失败 → 自动命名+自动写根因+自动写修复 |
+
+#### 11.2.6 自诊断 Agent 模式（Raindrop 2026）
+
+- **显式信号**: 错误率、延迟、成本、用户重新生成频率
+- **隐式信号**: 训练分类器 + Regex 检测用户沮丧、任务失败、拒绝、越狱
+- **自诊断**: Agent 通过专用内省工具报告自己的问题（工具失败、能力缺口、用户沮丧）
+- **Triage Agent**: 每日自主调查信号尖峰并执行根因分析
+
+**数据来源**: [Honeycomb AI Observability](https://www.dbta.com/Editorial/News-Flashes/Honeycomb-Offers-New-Observability-Tools-for-AI-Agents-173996.aspx), [LogicMonitor AI Observability](https://www.logicmonitor.com/blog/ai-observability), [UptimeRobot: Agent Monitoring](https://uptimerobot.com/knowledge-hub/monitoring/ai-agent-monitoring-best-practices-tools-and-metrics/), [FutureAGI: Observe Surfaces](https://futureagi.com/blog/observe-surfaces-tour/)
+
+---
+
+### 11.3 Agent 审计方法论
+
+#### 11.3.1 审计范式的根本转变
+
+2026 年 AI Agent 审计从 "nice-to-have" 变为 "must-have"：
+
+> "监管者现在要求**可追溯的意图**——哪个模型访问了哪个数据集、谁批准了 prompt、敏感值是否保持脱敏。" — FutureAGI (2026)
+
+**审计师现在问**: "谁查看了审计日志？"（审计之审计），要求操作员和审计员角色 RBAC 分离。
+
+#### 11.3.2 合规标准与 Agent 映射
+
+| 框架 | Agent 相关条款 | 要求 |
+|------|-------------|------|
+| **SOC 2** | CC6.1, CC7.2, CC7.3 | 进程隔离、不可变审计日志、监控 |
+| **ISO 27001:2022** | A.8.15, A.8.16, A.8.34 | 日志记录、监控活动、AI 子系统审计 |
+| **EU AI Act** | Art 15, 26, 55 | 高风险 AI 系统的强制性要求 |
+| **HIPAA** | 164.312(b), 164.308(a)(1)(ii)(D) | AI 子系统与 EHR 同等处理 |
+| **NIST AI RMF 1.0** | MEASURE 2.1–2.13 | AI 系统持续监测 |
+
+#### 11.3.3 监管链（Chain of Custody）—— 2026 年关键新要求
+
+| 要求 | 实现 |
+|------|------|
+| **防篡改日志** | SHA-256 哈希链式 Span，前置 Span 签名，每日 Merkle Root 发布 |
+| **全链路可追溯** | 每 Prompt、API 调用、工具调用、审批均捕获元数据（非原始内容） |
+| **法律冻结** | EU AI Act Art 26、SEC Rule 17a-4、HIPAA 违规调查均要求 "冻结这些 Trace" |
+| **审计之审计** | 审计日志的访问日志也必须不可变 |
+
+**标准 Ledger 审计 Schema**:
+
+```sql
+CREATE TABLE audit_ledger (
+    id              BIGINT PRIMARY KEY,
+    session_id      TEXT NOT NULL,
+    span_id         TEXT NOT NULL,       -- OTel Span ID
+    prev_span_hash  TEXT NOT NULL,       -- SHA-256 of previous row
+    event_type      TEXT NOT NULL,       -- 'llm_call' | 'tool_exec' | 'human_approval'
+    actor           TEXT NOT NULL,       -- 'agent' | 'human:<id>'
+    resource        TEXT,                -- tool name / API endpoint
+    input_hash      TEXT NOT NULL,       -- SHA-256, never raw content
+    output_hash     TEXT,                -- SHA-256
+    decision        TEXT,                -- 'allow' | 'deny' | 'escalate'
+    token_delta     INTEGER,
+    duration_ms     INTEGER,
+    compliance_tags TEXT[],              -- ['SOC2_CC7.2', 'GDPR_Art32', 'EU_AI_Act_Art15']
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_audit_session ON audit_ledger(session_id, created_at);
+CREATE INDEX idx_audit_compliance ON audit_ledger USING GIN(compliance_tags);
+```
+
+#### 11.3.4 核心审计工具 (2026)
+
+**AgentAuditKit** (开源, v0.3.24):
+- **215+ 规则**, 69 扫描模块, 覆盖 13 个 Agent 平台
+- 覆盖 OWASP Agentic Top 10 (10/10)、MCP Top 10 (10/10)
+- 合规映射至 **13 个框架**: EU AI Act, SOC 2, ISO 27001, ISO/IEC 42001, HIPAA, NIST AI RMF, NSA MCP Security CSI 等
+- 零云依赖，完全离线运行
+- PDF 审计报告: `--format pdf --framework soc2`
+- 48 小时 SLA 响应新 MCP CVE
+
+**AI Gateway 审计能力对比** (2026):
+
+| 平台 | 防篡改 | 保留期 | 多框架映射 |
+|------|--------|--------|-----------|
+| **Future AGI Command Center** | ✅ SHA-256 链 | 3月-10年分级 | 7/7 (SOC2, ISO27001, GDPR, HIPAA, PCI-DSS, NIST) |
+| **Portkey** | ⚠️ Object-lock + 每日完整性检查 | 最长 7 年 | SOC2, ISO27001 |
+| **TrueFoundry** | ⚠️ Append-only ClickHouse | 客户控制 | SOC2, ISO27001, HIPAA (BAA) |
+| **Kong AI Gateway** | 依赖 Sink | 存储层 | 插件驱动 |
+
+#### 11.3.5 2026 威胁态势
+
+- **30 个 MCP CVE 在 60 天内** (2026 年初) — 含 CVE-2026-33032 (认证绕过, CVSS 9.8)
+- **82% 公开 MCP 服务器**存在路径遍历问题 (2,614 服务器调查)
+- 常见攻击向量: 工具投毒、Hook 注入、供应链攻击、Prompt Injection、信任边界违规
+
+#### 11.3.6 审计就绪检查清单
+
+| # | 措施 | 合规要求 |
+|---|------|---------|
+| 1 | 实现防篡改日志 — SHA-256 哈希链, 不可变存储, 每日完整性证明 | SOC2 CC7.2 |
+| 2 | 捕获完整监管链 — 身份(加密验证)、资源、上下文元数据、授权决策、结果 | EU AI Act Art 15 |
+| 3 | 分离角色 — 操作员 vs 审计员 vs 合规负责人 (RBAC + SSO) | SOC2 CC6.3 |
+| 4 | 启用法律冻结 — 可对特定 Trace 冻结保留期限 | EU AI Act Art 26 |
+| 5 | 单 Schema 原生映射多框架 — 携带 SOC2/ISO27001/GDPR/HIPAA 标签 | ISO 27001 A.8.15 |
+| 6 | 预发布对抗仿真 — 在审计前捕获护栏失败 | NIST AI RMF MEASURE 2.1 |
+| 7 | MCP 专项安全扫描 — AgentAuditKit 等工具做离线合规检查 | OWASP Agentic Top 10 |
+| 8 | 分层保留策略 — 3 月/1 年/7 年按数据敏感度和监管要求 | GDPR Art.32 |
+| 9 | 实时 SIEM 导出 — 不等待季度审查 | SOC2 CC7.3 |
+
+**数据来源**: [FutureAGI: Compliance Audit Trails](https://futureagi.com/blog/best-ai-gateways-compliance-audit-trails-2026/), [AgentAuditKit (GitHub)](https://github.com/sattyamjjain/agent-audit-kit), [Aembit: Auditing MCP Server Access](https://aembit.io/blog/auditing-mcp-server-access/), [Nebius: Compliance Audit Agent Case Study](https://nebius.com/blog/posts/from-prototype-to-production-ready-agents)
+
+---
+
+## 12. 架构演进路线图
 
 ```
 当前 (v2.1): 单体 ReActDemo + 5 个企业模块
@@ -1343,7 +1599,7 @@ Phase 3 (v3.0): ── 7 ⽉底 (⽣产就绪)
 
 ---
 
-## 12. 参考⽂献
+## 13. 参考⽂献
 
 | 序号 | 来源 | 类型 | URL |
 |------|------|------|-----|
@@ -1386,10 +1642,11 @@ Phase 3 (v3.0): ── 7 ⽉底 (⽣产就绪)
 
 ---
 
-## 13. 版本历史
+## 14. 版本历史
 
 | 版本 | ⽇期 | 作者 | 变更说明 |
 |------|------|------|---------|
+| v1.5 | 2026-06-21 | AI Agent 架构组 | 新增第 11 章「Agent 评估·监测·审计方法论」—— 评估（六维量规、Trajectory Score、τ-bench 复合误差数学、三种框架混合模式、六维度 CI 闸门）、监测（六层指标矩阵、Honeycomb Agent Timeline、SLO 优先法、六可观测表面、自诊断 Agent 模式）、审计（SOC2/ISO27001/EU AI Act/HIPAA/NIST 合规映射、SHA-256 监管链、防篡改审计 Ledger Schema、AgentAuditKit 215+ 规则、MCP CVE 威胁态势、九项审计就绪检查清单）；报告扩展至 14 章 |
 | v1.4 | 2026-06-21 | AI Agent 架构组 | 新增第 10 章「四⼤⼯程学科」—— Prompt Engineering（⼗段结构、五条⾦规则、范式转变、Claude Code 优先级栈）、Context Engineering（KV-Cache 压缩、虚拟上下⽂、Token Budget、重复压缩问题）、Harness Engineering（11 组件模型、H0-H3 阶梯、三层策略执⾏、Claude Code 源码映射）、Loop Engineering（⽣产事故案例、状态机、Circuit Breaker+Ledger、终⽌条件矩阵、本项⽬对⽐）；参考⽂献扩展⾄ 40+ 项 |
 | v1.3 | 2026-06-21 | AI Agent 架构组 | 新增第 9 章「Agent 边界划定方法论」（六个思考维度：责任/信任/上下文/工具/生命周期/协作 + 决策树框架 + 行业反模式警示）；报告扩展至 12 章 |
 | v1.2 | 2026-06-21 | AI Agent 架构组 | 新增第 8 章「企业级 Agent 基础设施体系」（RAG 知识库关系型/向量数据库融合、三层缓存策略、六层鉴权模型、Prompt Injection 多层防御体系、Claude Code FSD 架构逆向与 Agent 隔离模式）；参考⽂献扩展⾄ 34 项 |
@@ -1398,4 +1655,4 @@ Phase 3 (v3.0): ── 7 ⽉底 (⽣产就绪)
 
 ---
 
-> **审计说明**: 本报告中所有数据、引⽤和结论均可在第 12 章"参考⽂献"中找到原始来源。需要时可根据参考⽂献 URL 追溯原始⽂档进⾏事实核查。沙箱安全章节的技术判断依据 Python 安全社区⻓期共识（PEP 551 已被官⽅拒绝）、OpenAI Agents SDK 2026.4 官⽅架构⽂档、E2B/AWS/Google Cloud 的⽣产安全模型，以及 CIS Docker Benchmark ⾏业标准。
+> **审计说明**: 本报告中所有数据、引⽤和结论均可在第 13 章"参考⽂献"中找到原始来源。需要时可根据参考⽂献 URL 追溯原始⽂档进⾏事实核查。沙箱安全章节的技术判断依据 Python 安全社区⻓期共识（PEP 551 已被官⽅拒绝）、OpenAI Agents SDK 2026.4 官⽅架构⽂档、E2B/AWS/Google Cloud 的⽣产安全模型，以及 CIS Docker Benchmark ⾏业标准。
