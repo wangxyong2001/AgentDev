@@ -160,6 +160,18 @@ Step 6: LLM 被误导 → 生成恶意 Action → 执行恶意代码
 
 **Anthropic 官方指南**: "XML 标签帮助 Claude 无歧义地解析复杂提示词, 尤其当提示词混合指令、上下文、示例和变量输入时。"
 
+#### 4.2a 补充：为什么 XML 而非 JSON 组织 System Prompt？
+
+| 维度 | XML 标签 | JSON 对象 |
+|------|---------|----------|
+| 注意力锚点 | `<guardrails>` 是语义标记，注意力机制天然识别 | `"guardrails": {` 是普通文本，无特殊锚点效应 |
+| 训练数据 | HTML/XML/Markdown 混合为预训练主要语料 | JSON 主要是结构化数据，非文档组织格式 |
+| 嵌套可定位性 | `</guardrails>` 闭合标签明确——模型能定位段落边界 | 哪个 `}` 关闭了 `"guardrails"` 对 LLM 模糊 |
+| 目标场景 | System Prompt 内部结构组织 | 工具 Schema、输出格式约束、Agent 间数据传递 |
+| API 支持 | 不依赖 API 特性——纯文本工作 | `response_format` 需 API 支持，本地 GGUF 不可用 |
+
+> 结论：XML 和 JSON 非竞争关系。System Prompt 结构用 XML（注意力锚点 + 语义导航），工具 Schema 用 JSON（类型检查 + API 强约束），配置文件用 YAML（人可读）。三者各司其职。
+
 ### 4.3 零成本高收益的判定依据
 
 - **零成本**: 纯文本改动, 不需要新依赖、新基础设施、新 API

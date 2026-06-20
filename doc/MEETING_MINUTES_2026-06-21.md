@@ -157,6 +157,32 @@ Agent 进程 (Trusted Runtime)
 | 4 | **System Prompt 重构为 XML 十段结构** — 零成本高收益 | 开发 + PM + 架构 |
 | 5 | **SQLite Session+Ledger 替换内存状态** — 边缘设备可靠性基础 | 架构 + 开发 + 测试 |
 
+#### 3.1.1 关于共识 4 的补充讨论：System Prompt 为什么用 XML 而不是 JSON？
+
+会议中提出了一个重要问题：**格式化 Prompt 用 XML 是流行做法吗？JSON 不是更合适？**
+
+**结论：XML 和 JSON 服务不同目的，不是非此即彼的选择。**
+
+| 场景 | 推荐格式 | 原因 |
+|------|---------|------|
+| **System Prompt 内部组织结构** | **XML 标签** | 注意力锚点效应：`<guardrails>` 是语义标记，模型在 4000 token 中能快速定位具体段落 |
+| **工具描述/参数定义** | **JSON Schema** (API `tools` 参数) | 类型检查、参数验证、API 级强制——但需 API 支持，本地 GGUF 模型受限 |
+| **约束模型输出格式** | **JSON Schema** (API `response_format`) | API 级强约束，非 Prompt 软请求——本地 GGUF 不适用 |
+| **Agent 间数据传递** | **JSON** | 机器可解析、类型安全——适合工具调用结构化返回值 |
+| **配置文件/协议** | **YAML** (当前 ReActProtocol.yaml) | 人可读、注释支持——更适合开发者维护的配置 |
+
+**为什么 XML 标签适合 System Prompt 组织？**
+
+1. **注意力锚点机制**: Anthropic 官方指南明确声明 "XML tags help Claude parse complex prompts unambiguously"。Blackmon Lab 的 Tealc 实验证实——将自由文本重写为 `<persona>` `<workflows>` `<guardrails>` XML 结构后，模型规则遵守率显著提升。
+
+2. **训练数据优势**: Claude 大量预训练于 HTML/XML/Markdown 混合文本。XML 标签在其注意力机制中是强信号。JSON `"guardrails": {` 在预训练语料中主要是机器数据格式，不是文档结构。
+
+3. **嵌套可定位性**: 模型在 4000 token 中找 `</guardrails>` 闭合标签比找 JSON 的匹配 `}` 容易。嵌套 JSON 中哪个 `}` 关闭了 `"guardrails"` 对 LLM 是模糊的。
+
+4. **视觉可读性**: `<guardrails>...</guardrails>` 的语义边界比 `{"guardrails": {...}}` 更清晰，人类开发者和 LLM 都能更快理解段落范围。
+
+**本项目适用性**: 本地 GGUF 模型不支持 OpenAI 的 `response_format` (JSON Schema)。当前 ReAct 输出格式 `Thought:\nAction:\nAction Input:` 是半结构化文本，不需要改为 JSON 输出。因此策略是：**System Prompt 用 XML 标签组织内部结构，输出保持 ReAct 文本格式，工具描述保留在 Python `@tool` Schema 中（不重复入 Prompt）。**
+
 ### 3.2 路线图共识调整
 
 ```
