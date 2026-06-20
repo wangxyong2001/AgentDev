@@ -3,26 +3,28 @@
 """
 ReAct Agent — Enterprise Edition (v3.0).
 
-Refactored from monolithic script into modular architecture:
-  config.py          → 12-Factor app configuration (env vars + dataclass)
-  exceptions.py      → Exception hierarchy (RecoverableError vs FatalError)
-  logging_config.py  → Structured logging (replaces ts_print)
-  response_parser.py → Unified parser (eliminates dual-path rot)
-  config.py          → 12-Factor app configuration
+Refactored from monolithic script into modular architecture.
 
-Architecture:
-  Factory
-  ├── ReActConfig.from_env()         → validated configuration
-  ├── setup_logging()                → structured logging
-  ├── ResponseParser(yaml_path)      → unified parser
-  └── run_react_agent(llm, ...)      → core loop (unchanged logic)
+Usage:
+  cd /path/to/AgentDev && python llama/ReActDemo
+  # or: PYTHONPATH=/path/to/AgentDev python /path/to/AgentDev/llama/ReActDemo
 """
 
 import os
-import re
 import sys
+
+# Ensure the parent directory (AgentDev/) is on sys.path so that
+# `from llama.xxx import yyy` works regardless of invocation directory.
+_PARENT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PARENT not in sys.path:
+    sys.path.insert(0, _PARENT)
+
+import re
 import json
 import time
+from typing import List, Dict, Any, Optional
+from dataclasses import dataclass, field
+from datetime import datetime
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, field
 from datetime import datetime
