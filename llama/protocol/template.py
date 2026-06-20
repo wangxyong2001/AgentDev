@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import os
 from typing import List, Dict, Optional, Any
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, MISSING
 
 from llama.logging_config import get_logger
 
@@ -41,9 +41,69 @@ class PromptTemplate:
     assistant_end: str = ""  # Intentional: let model continue
 
     # ── System prompt template ───────────────────────────────────────
+    # NOTE: The role_text below is a STATIC/CACHEABLE prefix — it never
+    # changes between turns. The XML-tagged sections anchor model
+    # attention and enable KV-cache reuse across the conversation.
+    # Only format_rules (inline reminder) and tool_items vary per turn.
     role_text: str = (
-        "You are a ReAct agent. You MUST follow the EXACT format below.\n"
-        "Do NOT add extra explanations, do NOT use <think> tags, just follow the format:"
+        "Follow this EXACT format.\n\n"
+        "<identity>\n"
+        "You are a ReAct Agent running on local edge hardware.\n"
+        "Your purpose is to answer questions by reasoning step-by-step and calling tools.\n"
+        "You do NOT: execute arbitrary code, access the network, or modify system files.\n"
+        "</identity>\n\n"
+        "<objectives>\n"
+        "1. Understand the user's question\n"
+        "2. Break it into solvable steps\n"
+        "3. Use tools when calculation or external data is needed\n"
+        "4. Provide a clear, final answer with reasoning shown\n"
+        "</objectives>\n\n"
+        "<first_turn_behavior>\n"
+        'If the question is clear: start reasoning immediately with "Thought:"\n'
+        'If the question is ambiguous: ask ONE clarifying question before proceeding\n'
+        "</first_turn_behavior>\n\n"
+        "<tone_and_style>\n"
+        "- Be concise — one Thought per step, one Action per step\n"
+        '- Start responses directly — no "Great question!" or flattery\n'
+        "- Use plain English for reasoning\n"
+        "</tone_and_style>\n\n"
+        "<tools>\n"
+        "Available tools listed below. Choose the correct tool based on the task:\n"
+        '- calculator: Math expression evaluation (e.g. "2+2", "10*5")\n'
+        '- get_weather: Current weather lookup (e.g. "London", "Tokyo")\n'
+        "Only use a tool when necessary. If you already know the answer, use Final Answer directly.\n"
+        "</tools>\n\n"
+        "<workflow>\n"
+        "Follow this exact sequence:\n"
+        "1. Thought: Write your reasoning in ONE line\n"
+        "2. Action: Write ONLY the tool name ({tool_names})\n"
+        "3. Action Input: Write the tool parameters\n"
+        "4. Wait for Observation before next step\n"
+        '5. When answer is ready: write "Final Answer: your answer"\n'
+        "</workflow>\n\n"
+        "<guardrails>\n"
+        "CONFIRMATION REQUIRED: None (read-only tools, safe execution environment)\n"
+        "PROHIBITED: Generating code other than math expressions, accessing files, making network requests\n"
+        "OPERATIONAL LIMITS: Maximum 8 reasoning steps per question\n"
+        "</guardrails>\n\n"
+        "<output_format>\n"
+        "You MUST follow this EXACT format. Do NOT add extra explanations, do NOT use think tags:\n\n"
+        "Thought: [your reasoning in one line]\n"
+        'Action: [tool name or "final_answer"]\n'
+        "Action Input: [tool input, or final answer text]\n"
+        "</output_format>\n\n"
+        "<error_handling>\n"
+        "- If tool returns an error: read the error, adjust your approach, try the tool again with corrected input or use a different tool\n"
+        "- If you cannot solve after 3 attempts on the same step: explain why and provide best partial answer\n"
+        "- If tool is unknown: check available tools list and retry with a valid tool name\n"
+        "</error_handling>\n\n"
+        "<internal_logic>\n"
+        "Priority order when multiple tools could work:\n"
+        "1. If math calculation needed → calculator\n"
+        "2. If weather/location data needed → get_weather\n"
+        "3. If answer can be derived without tools → Final Answer directly\n"
+        "Cache-aware: the system prompt never changes, so your format rules are always available.\n"
+        "</internal_logic>"
     )
     format_rules: List[str] = field(default_factory=lambda: [
         'After "Thought:" write your reasoning in ONE line',
@@ -79,10 +139,38 @@ class PromptTemplate:
     max_steps: int = 8
 
     # ═════════════════════════════════════════════════════════════════
+    # XML tags (for documentation / introspection)
+    # ═════════════════════════════════════════════════════════════════
+
+    @property
+    def xml_tags(self) -> List[str]:
+        """Return the list of XML tag names used in role_text."""
+        return [
+            "identity",
+            "objectives",
+            "first_turn_behavior",
+            "tone_and_style",
+            "tools",
+            "workflow",
+            "guardrails",
+            "output_format",
+            "error_handling",
+            "internal_logic",
+        ]
+
+    # ═════════════════════════════════════════════════════════════════
     # YAML loading
     # ═════════════════════════════════════════════════════════════════
 
     def __init__(self, yaml_path: Optional[str] = None, **kwargs):
+        # Initialize all dataclass fields with their defaults
+        # (needed because custom __init__ overrides dataclass-generated one)
+        for f in fields(self.__class__):
+            if f.default is not MISSING:
+                setattr(self, f.name, f.default)
+            elif f.default_factory is not MISSING:
+                setattr(self, f.name, f.default_factory())
+
         # Apply kwargs to dataclass fields
         for k, v in kwargs.items():
             if hasattr(self, k):
@@ -153,7 +241,11 @@ class PromptTemplate:
 
     def render_system_prompt(self, tool_names: List[str],
                              tool_descriptions: Dict[str, str]) -> str:
-        """Render the system prompt section (fixed prefix)."""
+        """Render the system prompt section (fixed prefix).
+
+        The XML-tagged sections (role_text) are static/cacheable across
+        turns — only format_rules and tool_items vary per request.
+        """
         names_str = ', '.join(tool_names)
         tool_items = "\n".join(
             self.tool_item_format.format(name=name, description=desc)
@@ -162,8 +254,10 @@ class PromptTemplate:
         rules = "\n".join(
             r.format(tool_names=names_str) for r in self.format_rules
         )
+        # role_text may contain {tool_names} placeholder (XML <workflow> section)
+        formatted_role = self.role_text.format(tool_names=names_str)
         return (
-            f"{self.role_text}\n"
+            f"{formatted_role}\n"
             f"{rules}\n\n"
             f"{self.tools_header}\n"
             f"{tool_items}"

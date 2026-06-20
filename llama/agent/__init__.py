@@ -4,14 +4,23 @@ Agent Core — ReAct reasoning loop as a state machine.
 Extracted from the monolithic run_react_agent():
 
   runner.py  — AgentCore: ReAct state machine with 8 states
-  hooks.py   — AgentHooks: Pre/PostToolUse interception points
+  budget.py  — TokenBudget + CircuitBreaker: cost control guards
+  ledger.py  — AuditLedger: append-only SQLite audit trail
 
 Phase 3 (future):
-  budget.py      — Token Budget management
+  hooks.py   — AgentHooks: Pre/PostToolUse interception points
   reflection.py  — Dead-loop detection via TurnDiff data
   grounding.py   — Conclusion verification against tool outputs
 """
 
 from llama.agent.runner import AgentCore
+from llama.agent.budget import TokenBudget, CircuitBreaker, CircuitBreakerError
+from llama.agent.ledger import AuditLedger
 
-__all__ = ["AgentCore"]
+__all__ = [
+    "AgentCore",
+    "TokenBudget",
+    "CircuitBreaker",
+    "CircuitBreakerError",
+    "AuditLedger",
+]
