@@ -74,10 +74,10 @@ def cmd_stats(db_path: str):
     rows = conn.execute("""
         SELECT
             COUNT(*) AS total,
-            SUM(CASE WHEN event_type='llm_call' THEN 1 ELSE 0 END) AS llm_calls,
-            SUM(CASE WHEN event_type='tool_exec' THEN 1 ELSE 0 END) AS tool_calls,
-            SUM(token_delta) AS total_tokens,
-            SUM(duration_ms) AS total_ms,
+            COALESCE(SUM(CASE WHEN event_type='llm_call' THEN 1 ELSE 0 END), 0) AS llm_calls,
+            COALESCE(SUM(CASE WHEN event_type='tool_exec' THEN 1 ELSE 0 END), 0) AS tool_calls,
+            COALESCE(SUM(token_delta), 0) AS total_tokens,
+            COALESCE(SUM(duration_ms), 0) AS total_ms,
             COUNT(DISTINCT session_id) AS sessions,
             MIN(created_at) AS first_event,
             MAX(created_at) AS last_event
@@ -89,8 +89,8 @@ def cmd_stats(db_path: str):
     print(f"    LLM 调用:      {rows['llm_calls']:,}")
     print(f"    工具调用:      {rows['tool_calls']:,}")
     print(f"    总会话数:      {rows['sessions']:,}")
-    print(f"    累计 Token:    {rows['total_tokens'] or 0:,}")
-    print(f"    累计耗时:      {rows['total_ms'] or 0:,}ms ({((rows['total_ms'] or 0)/1000):.1f}s)")
+    print(f"    累计 Token:    {rows['total_tokens']:,}")
+    print(f"    累计耗时:      {rows['total_ms']:,}ms ({(rows['total_ms']/1000):.1f}s)")
     print(f"    首次事件:      {rows['first_event'] or '-'}")
     print(f"    最后事件:      {rows['last_event'] or '-'}")
 
