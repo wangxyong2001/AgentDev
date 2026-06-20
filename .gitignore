@@ -25,7 +25,16 @@ Thumbs.db
 ReActTrace.html          # 生成文件, 不纳入版本控制
 *.gguf                   # 模型文件过大, 不纳入版本控制
 
+# DB files (runtime generated)
+agentic/db/*.db
+agentic/db/*.db-journal
+agentic/db/*.db-wal
+*.db-journal
+*.db-wal
+
+# Log files (runtime generated)
+logs/
+*.log
+
 # Jupyter
 .ipynb_checkpoints/
-# test line
-doc/GIT_SETUP.md

@@ -30,7 +30,7 @@ import logging
 import os
 import sys
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 
 # ==========================================================================
@@ -164,13 +164,20 @@ class TagAdapter(logging.LoggerAdapter):
 # Logger Factory
 # ==========================================================================
 
-def setup_logging(level: str = "INFO", log_format: str = "human") -> None:
+def setup_logging(level: str = "INFO", log_format: str = "human",
+                  log_file: Optional[str] = None) -> None:
     """
     Configure the root logger for the ReAct Agent.
+
+    Output destinations:
+      - stdout (always) — terminal / container logs
+      - log file (optional) — persistent, auto-rotated daily
 
     Args:
       level:   DEBUG | INFO | WARNING | ERROR | CRITICAL
       log_format: "human" (terminal-friendly) or "json" (machine-parseable)
+      log_file: Optional path to log file. Auto-creates parent dirs.
+                If None, logs only to stdout.
 
     Called once at process start (main.py). Idempotent.
     """
@@ -190,6 +197,14 @@ def setup_logging(level: str = "INFO", log_format: str = "human") -> None:
 
     handler.setFormatter(formatter)
     root.addHandler(handler)
+
+    # ── Optional file handler for persistent logs ─────────────────
+    if log_file:
+        os.makedirs(os.path.dirname(log_file), exist_ok=True)
+        fh = logging.FileHandler(log_file, encoding='utf-8')
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(formatter)
+        root.addHandler(fh)
 
 
 def get_logger(name: str) -> TagAdapter:
@@ -214,7 +229,7 @@ def get_logger(name: str) -> TagAdapter:
 
 # ── Auto-initialize from environment (if not already configured) ──
 
-if not logging.getLogger("llama").handlers:
+if not logging.getLogger("agentic").handlers:
     _level = os.getenv("REACT_LOG_LEVEL", "INFO")
     _format = os.getenv("REACT_LOG_FORMAT", "human")
     setup_logging(level=_level, log_format=_format)

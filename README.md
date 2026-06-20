@@ -12,10 +12,10 @@
 A **fully offline ReAct (Reasoning + Acting) Agent** running on NVIDIA Jetson Orin / DGX Spark edge devices. The agent loads a 22GB quantized Qwen3.6-35B GGUF model locally, calls tools (calculator, weather), and reasons through multi-step problems — all without network connectivity.
 
 ```
-User: "What's the weather in Tokyo multiplied by 2?"
+User: "What's the weather in Shanghai multiplied by 2?"
   │
-  ├─ Thought: Need Tokyo weather first
-  │  Action: get_weather("Tokyo")  →  Observation: "Sunny, 25°C"
+  ├─ Thought: Need Shanghai weather first
+  │  Action: get_weather("Shanghai")  →  Observation: "Sunny, 25°C"
   │
   ├─ Thought: Now multiply by 2
   │  Action: calculator("25 * 2")  →  Observation: 50

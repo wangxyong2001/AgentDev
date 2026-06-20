@@ -36,7 +36,8 @@ if config is None:
     print("[FATAL] Configuration failed. Check REACT_MODEL_PATH.", file=sys.stderr)
     sys.exit(1)
 
-setup_logging(level=config.log_level, log_format=config.log_format)
+setup_logging(level=config.log_level, log_format=config.log_format,
+              log_file=os.path.join(os.path.dirname(__file__), "agentic", "db", "agent.log"))
 logger = get_logger(__name__)
 
 logger.init(f"ReAct Agent v3.0 — Enterprise Edition")
@@ -73,7 +74,7 @@ def main():
         model_name=llm.model_name,
         pricing=config.price_for("qwen3.6-35b"),
     )
-    ledger = AuditLedger(db_path=os.path.join(config.trace_output_dir, "agent_audit.db"))
+    ledger = AuditLedger()  # auto: agentic/db/agent_audit.db
     logger.init(f"Audit ledger: {ledger._db_path}")
 
     # ── Step 6: AgentCore ──────────────────────────────────────────
@@ -91,7 +92,7 @@ def main():
     test_questions = [
         "What is 123 multiplied by 45?",
         "What is the weather in London multiplied by 2?",
-        "Tell me the weather in Tokyo and then add 10 to it.",
+        "Tell me the weather in Shanghai and then add 10 to it.",
     ]
 
     with ledger:

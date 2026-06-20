@@ -30,21 +30,109 @@ class PromptTemplate:
     into a complete prompt string for LLM consumption.
 
     Configurable via YAML protocol file or built-in Qwen2 defaults.
+
+    =====================
+    Cacheability Strategy
+    =====================
+
+    The prompt assembly order is designed to maximise KV-cache reuse
+    across turns. Because the system prompt XML sections (role_text)
+    are IDENTICAL across every turn, a cache-friendly inference engine
+    can reuse the computed KV entries for the prefix from the previous
+    turn, only computing new tokens for the user message and history.
+
+    Cacheable (static across turns):
+      - role_text (all XML-tagged sections)
+      - format_rules (tool names vary, but the rule strings are fixed)
+      - tools_header + tool_item_format (tool *descriptions* vary,
+        but the structural prefix is reused)
+
+    Varies per turn (not cacheable):
+      - user_template (question changes)
+      - history_entry_format (history grows)
+      - trigger (always "Thought:" — this is the model's cue to start
+        generating, and marks the boundary between input and output)
     """
 
     # ── Delimiters ───────────────────────────────────────────────────
+    # Chat-template markers that wrap each role's content. These are
+    # model-specific: the defaults below target Qwen2 (ChatML format),
+    # but they can be overridden via YAML for other models (e.g. Llama 3
+    # uses <|start_header_id|>...<|end_header_id|>).
     system_start: str = "<|im_start|>system\n"
     system_end: str = "<|im_end|>"
     user_start: str = "<|im_start|>user\n"
     user_end: str = "<|im_end|>"
     assistant_start: str = "<|im_start|>assistant\n"
-    assistant_end: str = ""  # Intentional: let model continue
+    # NOTE: assistant_end is intentionally empty (""). We want the model
+    # to continue generating without a closing delimiter. If we placed
+    # <|im_end|> here, the model would stop before producing its output.
+    assistant_end: str = ""
 
     # ── System prompt template ───────────────────────────────────────
-    # NOTE: The role_text below is a STATIC/CACHEABLE prefix — it never
+    #
+    # IMPORTANT — Cacheability note:
+    # The role_text below is a STATIC/CACHEABLE prefix — it never
     # changes between turns. The XML-tagged sections anchor model
     # attention and enable KV-cache reuse across the conversation.
     # Only format_rules (inline reminder) and tool_items vary per turn.
+    #
+    # Each XML section has a specific design rationale:
+    #
+    #   <identity>
+    #     Establishes the agent's persona upfront. This anchors the
+    #     model's self-perception before any instructions, reducing
+    #     persona-jacking attacks where injected content later in
+    #     the prompt tries to redefine the agent's role.
+    #
+    #   <objectives>
+    #     High-level task decomposition guide. This sets the reasoning
+    #     strategy before tool details, so the model thinks in terms
+    #     of steps first, tool selection second.
+    #
+    #   <first_turn_behavior>
+    #     Handles the ambiguous-question case explicitly. Without this,
+    #     the model might guess rather than ask for clarification,
+    #     leading to wasted turns.
+    #
+    #   <tone_and_style>
+    #     Prevents "social padding" (phrases like "Great question!")
+    #     that wastes tokens and adds latency. The "one line per step"
+    #     constraint keeps the output parseable by the regex parser.
+    #
+    #   <tools>
+    #     Inline tool definitions. These are static examples — the
+    #     actual dynamic tool list is appended via tools_header +
+    #     tool_items later. The static examples serve as a fallback
+    #     in case the dynamic list is truncated or mis-ordered.
+    #
+    #   <workflow>
+    #     The core ReAct loop specification. The {tool_names} placeholder
+    #     is substituted at render time. The "one line per Thought"
+    #     constraint is critical for parseability — multi-line thoughts
+    #     confuse the regex-based parser.
+    #
+    #   <guardrails>
+    #     Explicit safety constraints. These are separated from the
+    #     instructions so they stand out as immutable rules, not
+    #     procedural suggestions. The "CONFIRMATION REQUIRED" header
+    #     pattern is used by downstream safety filters.
+    #
+    #   <output_format>
+    #     The exact format the parser expects. The parser's regex patterns
+    #     (P1-P4) are designed against this format — changing this section
+    #     without updating parser.py will break parsing.
+    #
+    #   <error_handling>
+    #     Recovery strategies for common failure modes. Without explicit
+    #     error-handling guidance, the model tends to retry the same
+    #     failing action repeatedly (perseveration failure).
+    #
+    #   <internal_logic>
+    #     Decision-priority rules for tool selection. The "Cache-aware"
+    #     line reminds the model that the system prompt is always available
+    #     (via KV-cache), so it doesn't need to re-read it.
+    #
     role_text: str = (
         "Follow this EXACT format.\n\n"
         "<identity>\n"
@@ -115,9 +203,16 @@ class PromptTemplate:
     tool_item_format: str = "- {name}: {description}"
 
     # ── User message template ────────────────────────────────────────
+    # Simple substitution template. The question is the only variable
+    # part — wrapping it in <user> delimiters is handled by the
+    # render_full_prompt method's assembly order.
     user_template: str = "{question}"
 
     # ── History entry format ─────────────────────────────────────────
+    # Each ReAct turn produces one history entry. The format matches
+    # what the LLM outputs (Thought/Action/Action Input/Observation)
+    # so the assembled history looks like a natural continuation of
+    # the conversation.
     history_entry_format: str = (
         "Thought: {thought}\n"
         "Action: {action}\n"
@@ -126,9 +221,16 @@ class PromptTemplate:
     )
 
     # ── Trigger ──────────────────────────────────────────────────────
+    # The trigger text is appended after the history. It cues the model
+    # to start generating its next Thought. "Thought:" is the standard
+    # ReAct trigger because it's the first token of every agent output.
     trigger: str = "Thought:"
 
     # ── Stop sequences ───────────────────────────────────────────────
+    # The LLM should stop generating when it produces these tokens.
+    # "Observation:" marks the boundary where tool output begins (we
+    # generate the Observation externally, not via the LLM).
+    # <|im_end|> is the Qwen2 end-of-turn token.
     stop_sequences: List[str] = field(default_factory=lambda: [
         "Observation:", "<|im_end|>",
     ])
@@ -144,7 +246,16 @@ class PromptTemplate:
 
     @property
     def xml_tags(self) -> List[str]:
-        """Return the list of XML tag names used in role_text."""
+        """Return the list of XML tag names used in role_text.
+
+        These tags serve as the canonical inventory of prompt sections.
+        Each tag anchors a specific behavioural directive, and the tag
+        names are used by downstream metrics code to measure per-section
+        prompt reuse.
+
+        Returns:
+            List of XML tag names in display order (same order as role_text).
+        """
         return [
             "identity",
             "objectives",
@@ -163,24 +274,79 @@ class PromptTemplate:
     # ═════════════════════════════════════════════════════════════════
 
     def __init__(self, yaml_path: Optional[str] = None, **kwargs):
-        # Initialize all dataclass fields with their defaults
-        # (needed because custom __init__ overrides dataclass-generated one)
+        """
+        Custom __init__ because @dataclass generates one, but we need
+        to interleave YAML loading with field initialisation.
+
+        Why the manual field loop:
+          A dataclass auto-generates __init__ with positional args for
+          every field. When we override __init__ with a custom signature
+          (yaml_path, **kwargs), the dataclass-generated __init__ is
+          replaced — so we must manually initialise each field from its
+          default/default_factory, then apply kwargs overrides, then
+          optionally load YAML on top.
+
+        This three-layer override chain is:
+          1. Dataclass defaults (hardcoded Qwen2 values above)
+          2. **kwargs (programmatic overrides from callers)
+          3. YAML protocol file (on-disk configuration, highest priority)
+
+        Args:
+            yaml_path: Path to agentic/protocol/ReActProtocol.yaml.
+                If None, only defaults + kwargs are used.
+            **kwargs: Field-by-field overrides applied BEFORE YAML,
+                so YAML can still override them. This enables callers
+                to set a fallback value that YAML can replace.
+        """
+        # Step 1: Initialise all dataclass fields with their defaults.
+        # This is necessary because the custom __init__ replaces the
+        # auto-generated one, so fields would remain unset otherwise.
         for f in fields(self.__class__):
             if f.default is not MISSING:
+                # Simple default value (string, int, etc.)
                 setattr(self, f.name, f.default)
             elif f.default_factory is not MISSING:
+                # Fields with default_factory (list, dict, etc.) need
+                # the factory called to create a fresh instance — shared
+                # mutable defaults are a classic Python gotcha.
                 setattr(self, f.name, f.default_factory())
 
-        # Apply kwargs to dataclass fields
+        # Step 2: Apply kwargs to dataclass fields.
+        # This allows callers like PromptTemplate(temperature=0.1) to
+        # override individual fields without touching YAML.
         for k, v in kwargs.items():
             if hasattr(self, k):
                 setattr(self, k, v)
 
+        # Step 3: Load YAML overrides (highest priority).
         if yaml_path:
             self._load_yaml(yaml_path)
 
     def _load_yaml(self, yaml_path: str) -> None:
-        """Load prompt configuration from YAML protocol file."""
+        """Load prompt configuration from YAML protocol file.
+
+        This method selectively overrides instance attributes from the
+        YAML dict. Only keys that exist in the YAML config are changed;
+        any field not present in YAML keeps its current value (whether
+        from defaults or kwargs).
+
+        YAML structure expected (from ReActProtocol.yaml):
+          prompt:
+            delimiters: {system_start, system_end, ...}
+            sections:
+              system: {role, format_rules, tools_header, tool_item_format}
+              user: {template}
+              history: {entry_format}
+              trigger: "..."
+          response:
+            generation: {max_tokens, temperature, max_steps}
+            stop_sequences: [...]
+
+        Graceful degradation:
+          - If pyyaml is not installed: log a warning and keep defaults.
+          - If the file does not exist: log a warning and keep defaults.
+          - If a key is missing from the YAML: keep the current value.
+        """
         try:
             import yaml
         except ImportError:
@@ -196,7 +362,9 @@ class PromptTemplate:
 
         prompt_cfg = cfg.get("prompt", {})
 
-        # Delimiters
+        # Delimiters — model-specific chat template tokens.
+        # These are kept separate from sections because they're a
+        # model property, not a content property.
         d = prompt_cfg.get("delimiters", {})
         if d:
             self.system_start = d.get("system_start", self.system_start)
@@ -206,7 +374,7 @@ class PromptTemplate:
             self.assistant_start = d.get("assistant_start", self.assistant_start)
             self.assistant_end = d.get("assistant_end", self.assistant_end)
 
-        # Sections
+        # Sections — the actual prompt content broken into role blocks.
         sections = prompt_cfg.get("sections", {})
         sys_sec = sections.get("system", {})
         if sys_sec:
@@ -225,7 +393,7 @@ class PromptTemplate:
 
         self.trigger = sections.get("trigger", self.trigger)
 
-        # Response config
+        # Response config — generation parameters and stop sequences.
         resp_cfg = cfg.get("response", {})
         gen_cfg = resp_cfg.get("generation", {})
         self.max_tokens = gen_cfg.get("max_tokens", self.max_tokens)
@@ -245,6 +413,19 @@ class PromptTemplate:
 
         The XML-tagged sections (role_text) are static/cacheable across
         turns — only format_rules and tool_items vary per request.
+
+        Assembly order:
+          1. role_text with {tool_names} substituted (cacheable base)
+          2. format_rules with {tool_names} substituted (small variation)
+          3. tools_header + dynamic tool_items (varies if tool set changes)
+
+        Args:
+            tool_names: List of tool names for {tool_names} placeholder.
+            tool_descriptions: Dict mapping name -> description for
+                dynamic tool list rendering.
+
+        Returns:
+            Fully rendered system prompt string (without delimiters).
         """
         names_str = ', '.join(tool_names)
         tool_items = "\n".join(
@@ -264,12 +445,31 @@ class PromptTemplate:
         )
 
     def render_user_message(self, question: str) -> str:
-        """Render the user message section."""
+        """Render the user message section.
+
+        Args:
+            question: The user's input string.
+
+        Returns:
+            The user message content (without delimiters — delimiters
+            are added by render_full_prompt).
+        """
         return self.user_template.format(question=question)
 
     def render_history_entry(self, thought: str, action: str,
                              action_input: str, observation: str) -> str:
-        """Render a single ReAct history entry."""
+        """Render a single ReAct history entry.
+
+        Args:
+            thought: Model's reasoning line.
+            action: Tool name called (or "final_answer").
+            action_input: Parameters passed to the tool.
+            observation: Tool output.
+
+        Returns:
+            Formatted history entry string ready to be appended to
+            the assistant section.
+        """
         return self.history_entry_format.format(
             thought=thought, action=action,
             action_input=action_input, observation=observation,
@@ -283,6 +483,23 @@ class PromptTemplate:
 
         Assembly order (Canonical cache-friendly order):
           <system> → <user> → <assistant + history> → Thought:
+
+        This order is designed for KV-cache reuse:
+          - The <system> block is identical across turns (cacheable).
+          - The <user> block typically changes per turn (not cacheable).
+          - The <assistant> + history grows monotonically (partially
+            cacheable — the prefix of history from previous turns can
+            be reused).
+          - "Thought:" is the generation trigger (always the same).
+
+        Args:
+            tool_names: List of tool names for prompt rendering.
+            tool_descriptions: Dict of tool name -> description.
+            question: The current user question.
+            history: Accumulated ReAct history string (pre-formatted).
+
+        Returns:
+            Complete prompt string ready for LLM inference.
         """
         system = self.render_system_prompt(tool_names, tool_descriptions)
         user_msg = self.render_user_message(question)
