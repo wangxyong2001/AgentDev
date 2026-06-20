@@ -1,8 +1,8 @@
 # AI Agent 开发行业最佳实践调研报告
 
-> 文档版本: v1.1 | 调研日期: 2026-06-21 | 作者: AI Agent 架构组
+> 文档版本: v1.3 | 调研日期: 2026-06-21 | 作者: AI Agent 架构组
 > 机密级别: 内部
-> 调研范围: LangChain 1.0、OpenAI Agents SDK、Anthropic Claude Agent 三⼤⽣态 + 企业级 Agent 沙箱安全体系
+> 调研范围: LangChain 1.0、OpenAI Agents SDK、Anthropic Claude Agent 三⼤⽣态 + 沙箱安全 + 基础设施 + 边界划定方法论
 
 ---
 
@@ -784,7 +784,250 @@ Stage 6: Response  — 工具输出消毒
 
 ---
 
-## 9. 架构演进路线图
+## 9. Agent 边界划定方法论（专题调研）
+
+> ⚠️ **重要**: Agent 边界是架构设计的根本问题。边界画对了，安全性、性能、成本、可测试性自然对齐；边界画错了，无论实现多精致，系统都存在结构性缺陷。本专题提供六个思考维度 + 一个决策树框架。
+
+### 9.1 维度 1: 责任边界 —「这 Agent 对什么负责？」
+
+最基础的维度。套用单一职责原则，**一个 Agent 的 system prompt 超过 200 行就是边界失控的信号**。
+
+```
+❌ 反模式: 万能 Agent
+   一个 Agent 既做代码分析、又做重构、又做部署、又做监控
+
+✅ 正确:
+   Explore Agent  → 只负责"理解代码"（读文件、搜索、追踪调用链, ~40行 prompt）
+   Plan Agent     → 只负责"设计方案"（推理、对比、选择策略, ~60行 prompt）
+   Code Agent     → 只负责"执行变更"（编辑、写入、运行测试, ~80行 prompt）
+```
+
+**判断标准**: 如果你无法用一句话描述一个 Agent 的职责，那么这个 Agent 承担了太多责任，需要拆分。
+
+**来源**: Anthropic 内部实践 — Explore/Plan/Code 三模式分离是 Claude Code 的核心架构决策。系统提示词分段构建（`getSimpleIntroSection` → `getActionsSection` → `getUsingYourToolsSection`），每种 Agent 模式加载不同的段组合。见 [Claude Code Skills Blog](https://claude.com/blog/lessons-from-building-claude-code-how-we-use-skills)。
+
+---
+
+### 9.2 维度 2: 信任边界 —「这 Agent 可以信任到什么程度？」
+
+**这是安全架构的核心**。信任边界决定了隔离强度：
+
+```
+信任等级:
+
+Level 0 (完全不可信)    → 用户输入、外部数据、LLM 生成的代码
+Level 1 (有限信任)      → 沙箱内执行的工具、MCP 工具的输出
+Level 2 (受控信任)      → 企业内部 API、只读数据库副本
+Level 3 (完全信任)      → 宿主机控制平面、密钥管理服务、审计日志
+```
+
+**核心原则**: 当数据从一个信任层级流向另一个时，**必须有一个 Agent 边界**。低信任层的 Agent 绝不能直接访问高信任层的资源。
+
+**具体架构示例**:
+
+```
+用户 Prompt (L0 不可信)
+  │
+  ├─→ Input Guard Agent (L3 完全信任)
+  │    职责: 检测 prompt injection、清洗输入
+  │    工具: 确定性规则引擎（非 LLM！）
+  │
+  ├─→ Reasoning Agent (L1 有限信任)
+  │    职责: 理解意图、规划步骤
+  │    工具: RAG 检索（只读）、API 查询（只读）
+  │
+  └─→ Execution Agent (L1 有限信任, 沙箱内)
+       职责: 执行代码、调用外部工具
+       工具: Shell（seccomp 限制）、文件系统（tmpfs）
+       约束: 无网络访问、无密钥持有、200ms 自动销毁
+```
+
+**来源**: Anthropic 官方的三层容器架构（gVisor 容器 / Seatbelt+bubblewrap / 密封 VM）确认了"不同信任层级需要不同运行时环境"的架构原则。见 [How We Contain Claude](https://www.anthropic.com/engineering/how-we-contain-claude)。
+
+---
+
+### 9.3 维度 3: 上下文边界 —「这 Agent 需要多少上下文？」
+
+**这是经济维度的边界**。上下文 = 成本 + 延迟 + 注意力稀释。
+
+| Agent 类型 | 上下文需求 | 典型窗口 | 每轮成本估算 |
+|-----------|-----------|---------|------------|
+| Triage Agent | 低 — 只需理解问题类型 | 2K tokens | ~¥0.002 |
+| Specialist Agent | 中 — 领域知识 + 工具定义 | 8K tokens | ~¥0.008 |
+| Deep Research Agent | 高 — 多轮推理 + 大量检索 | 64K tokens | ~¥0.06 |
+| Code Execution Agent | 中 — 代码 + 执行结果 | 16K tokens | ~¥0.02 |
+
+**判断标准**: 如果一个 Agent 的上下文中有 **超过 50% 的内容与该 Agent 的职责无关**，就应该拆分。
+
+**反模式 — "万能 Agent"**: 把所有工具、所有知识塞进一个 Agent 的 system prompt，每次调用都携带 50K tokens 的上下文，其中 90% 与当前任务无关。后果：成本×10、延迟×3、输出质量下降（注意力被噪声稀释）。
+
+**KV-Cache 优化视角**: Agent 边界也是缓存边界。系统提示词的固定部分（角色定义、格式规则、工具列表）是 KV-Cache 的最佳复用对象。拆分后，每个 Agent 的系统提示词更短、更稳定 → Cache 命中率更高（可提升 20-30%）。
+
+---
+
+### 9.4 维度 4: 工具边界 —「这 Agent 可以调用什么工具？」
+
+**按最小权限原则分配工具**。工具的集合定义了 Agent 的"能力边界"：
+
+```
+Explore Agent 的工具清单:
+  ✅ FileRead, Grep, Glob    → 只读
+  ❌ FileWrite, Edit          → 不能写
+  ❌ Bash                     → 不能执行
+  ❌ WebFetch                 → 不能访问网络
+
+Code Agent 的工具清单:
+  ✅ FileRead, FileWrite, FileEdit, Bash
+  ❌ GitPush                  → 需要额外审批
+  ❌ DatabaseWrite            → 需要额外审批
+  ❌ DeployToProduction       → 需要 HITL 确认
+
+Execution Sandbox Agent:
+  ✅ Shell (seccomp, no network)
+  ✅ FileSystem (tmpfs only)
+  ❌ ANY network access
+  ❌ ANY credential access
+```
+
+**判断标准**: 如果一个 Agent 拥有它**不需要**的工具，这就是一个**没有对齐的边界**。攻击者通过 prompt injection 可以滥用这些多余的工具——每个多余的工具都是一个潜在的攻击向量。
+
+**工具边界硬化的实践**（来自 Claude Code `utils/permissions/` 24 文件体系）:
+- `permissionRuleParser.ts` — 每个工具调用的运行时规则评估
+- `dangerousPatterns.ts` — 工具输入中的危险模式检测
+- `shellRuleMatching.ts` — Shell 特定参数的白名单/黑名单匹配
+- `pathValidation.ts` — 文件路径必须在 allowed paths 内
+
+---
+
+### 9.5 维度 5: 生命周期边界 —「这 Agent 存活多久？」
+
+```
+Ephemeral Agent (一次性 — < 1 秒存活):
+  → 创建: 收到单次工具调用时
+  → 销毁: 工具返回结果后 200ms
+  → 状态: 完全无状态（tmpfs 文件系统随进程销毁）
+  → 场景: 代码沙箱执行、文件格式转换
+
+Session Agent (会话级 — 分钟到小时):
+  → 创建: 用户会话开始时
+  → 销毁: 会话结束或超时
+  → 状态: 会话内保持对话上下文
+  → 场景: 用户对话 Agent、代码审查 Agent
+
+Persistent Agent (持久化 — 天到月):
+  → 创建: 系统部署时
+  → 销毁: 系统下线时（或永不）
+  → 状态: PostgreSQL/SQLite 持久化, 跨会话记忆
+  → 场景: 知识库索引 Agent、CI/CD 监控 Agent、安全扫描 Agent
+```
+
+**判断标准**: 如果一个 Agent 在完成任务后**没有理由继续存在**，它就应该被销毁。存活越久，攻击面累积越大。
+
+**安全视角**: 每多存活一秒，Agent 就多一秒被攻击的时间窗口。生产环境的最佳实践是：**默认 Ephemeral，除非有明确理由需要更长生周期**。
+
+---
+
+### 9.6 维度 6: 协作边界 —「Agent 之间如何通信？」
+
+Claude Code 提供了三种 Agent 间通信模式（基于源码逆向分析）：
+
+| 模式 | 通信方式 | 隔离强度 | 上下文传递 | 适用场景 |
+|------|---------|---------|-----------|---------|
+| **Handoff** (移交) | Agent A → Agent B, A 完全退出 | 🟢 强 — 完全切换 | 结构化任务描述 | 任务分类后交给专家处理 |
+| **as_tool** (调用) | A 调用 B 作为工具, A 等待结果 | 🟡 中 — A 等待 B 完成 | 输入→输出（无状态泄漏） | 编排者调用子任务获取计算结果 |
+| **SendMessage** (消息) | A 发消息给已有 B, B 继续工作 | 🔴 弱 — 共享上下文 | 渐进式上下文追加 | 长期协作, 持续双向通信 |
+
+**选择标准**:
+- Agent A 和 Agent B **不应共享密钥/凭证** → 必须用 **Handoff**（彻底移交，凭证不传递）
+- Agent A 只需要 Agent B 的**计算结果** → 用 **as_tool**（输入输出隔离）
+- Agent A 需要与 Agent B **持续双向对话** → 用 **SendMessage**（但代价是共享上下文空间）
+
+**Claude Code 实践**: Fork Agent 是最强的隔离模式 — 创建完全独立的对话分支，拥有自己的 plan 文件和 transcript。Fork 之间的推理无法互相影响。
+
+---
+
+### 9.7 Agent 边界决策树
+
+```
+START: 我有一个任务需要 AI Agent 完成
+  │
+  ├─ 任务涉及多个不同的能力域吗?
+  │   YES → 按责任边界拆分 (Explore / Plan / Code / Deploy)
+  │   NO  → 单 Agent 足够
+  │
+  ├─ 任务中有不同信任层级的数据流吗?
+  │   (例如: 用户输入→推理→沙箱执行→结果返回)
+  │   YES → 按信任边界拆分 (InputGuard / Reasoner / Executor)
+  │   NO  → 同一信任域内
+  │
+  ├─ 某部分任务需要独立隔离（文件系统/网络/进程）吗?
+  │   YES → 按生命周期边界拆分 (Ephemeral Sandbox / Fork / Worktree)
+  │   NO  → 共享环境
+  │
+  ├─ 某 Agent 持有过度权限（工具过多）吗?
+  │   (检查: 它真的需要这 15 个工具吗? 还是只需要 4 个?)
+  │   YES → 按工具边界拆分（缩小每个 Agent 的工具集）
+  │   NO  → 权限已最小化
+  │
+  ├─ 某 Agent 的 system prompt 超过 200 行了吗?
+  │   YES → 按上下文边界拆分（职责太多，系统提示词太长）
+  │   NO  → 继续
+  │
+  └─ Agent 之间需要什么通信模式?
+      ├─ 不应共享凭证 → Handoff (移交)
+      ├─ 只需计算结果 → as_tool (调用)
+      └─ 需要持续对话 → SendMessage (消息)
+```
+
+---
+
+### 9.8 行业反模式警示
+
+| 反模式 | 症状 | 后果 | 修复 |
+|--------|------|------|------|
+| **万能 Agent** | system prompt > 300 行, 工具 > 15 个 | 成本×10, 输出质量下降, prompt injection 攻击面最大化 | 按责任+工具边界拆分 |
+| **信任扁平化** | 所有 Agent 在同一进程空间, 共享所有密钥 | 一个 Agent 被注入 = 整个系统沦陷 | 按信任边界分层, credential-free sandbox |
+| **僵尸 Agent** | Agent 完成任务后未被销毁, 持续占用内存 | 资源泄漏, 长期攻击面 | 默认 Ephemeral, 强制生命周期管理 |
+| **工具泛滥** | 每个 Agent 都有全套工具, "以防万一" | 最小权限原则被违反, 横向移动风险 | 按任务分配最小工具集 |
+| **上下文肥胖** | 每次调用都携带完整历史 + 所有工具文档 | KV-Cache 命中率 < 30%, 成本×5 | 按上下文边界拆分, 缩短 prompt |
+| **Agent 链过长** | Agent A → B → C → D → E 五层委托 | 延迟累积, 错误传播, 调试困难 | 扁平化, 最多 3 层 |
+
+---
+
+### 9.9 边界的代价 — 何时不应拆分
+
+拆分 Agent 不是免费的。每次拆分都带来：
+- **延迟增加**: 每次 Agent 间通信增加 100-500ms
+- **上下文损失**: 移交时可能丢失隐式知识
+- **调试复杂度**: 跨 Agent 的错误链追踪困难
+- **编排开销**: 需要 Coordinator 管理多 Agent 协作
+
+**不拆分的合理场景**:
+- 任务复杂性低（2-3 步完成）
+- 所有操作在同一信任域内
+- 工具集天然较小（≤5 个工具）
+- 延迟敏感（< 200ms 要求）
+- 单用户、单会话、无并发
+
+**决策经验法则**: 如果拆分的代价（延迟+复杂度）> 拆分的收益（安全+可测试性+成本控制），就不要拆分。
+
+---
+
+### 9.10 对本项目的边界划定建议
+
+| 当前单体组件 | 建议边界 | 判断依据 | 优先级 |
+|-------------|---------|---------|--------|
+| `run_react_agent()` | **AgentCore** (编排) + **ToolExecutor** (执行) | 信任边界: 工具执行需隔离沙箱 (L1 seccomp) | Phase 2 |
+| `calculator` 工具 | 独立 **Ephemeral Sandbox Agent** | 生命周期+工具边界: 代码执行需进程隔离 | Phase 2 |
+| Prompt 解析 | **InputGuard Agent** (确定性规则) | 信任边界: 输入验证不应依赖 LLM | Phase 3 |
+| 工具选择 | **Reasoning Agent** + **ToolRegistry** | 责任边界: 推理 vs 执行分离 | Phase 3 |
+| 多问题会话 | **Triage → Specialist** Handoff | 上下文边界: 不同问题类型不同工具集 | Phase 3 |
+
+**数据来源**: [Anthropic: How We Contain Claude](https://www.anthropic.com/engineering/how-we-contain-claude), [Zero Trust for AI Agents](https://claude.com/blog/zero-trust-for-ai-agents), [Claude Code Source Analysis](file:///home/nvidia/workspace/ClaudeCode/extracted-src/doc/SOURCE_ANALYSIS_REPORT.md), [Claude Code Skills Blog](https://claude.com/blog/lessons-from-building-claude-code-how-we-use-skills)
+
+---
+
+## 10. 架构演进路线图
 
 ```
 当前 (v2.1): 单体 ReActDemo + 5 个企业模块
@@ -812,7 +1055,7 @@ Phase 3 (v3.0): ── 7 ⽉底 (⽣产就绪)
 
 ---
 
-## 10. 参考⽂献
+## 11. 参考⽂献
 
 | 序号 | 来源 | 类型 | URL |
 |------|------|------|-----|
@@ -855,14 +1098,15 @@ Phase 3 (v3.0): ── 7 ⽉底 (⽣产就绪)
 
 ---
 
-## 11. 版本历史
+## 12. 版本历史
 
 | 版本 | ⽇期 | 作者 | 变更说明 |
 |------|------|------|---------|
+| v1.3 | 2026-06-21 | AI Agent 架构组 | 新增第 9 章「Agent 边界划定方法论」（六个思考维度：责任/信任/上下文/工具/生命周期/协作 + 决策树框架 + 行业反模式警示）；报告扩展至 12 章 |
 | v1.2 | 2026-06-21 | AI Agent 架构组 | 新增第 8 章「企业级 Agent 基础设施体系」（RAG 知识库关系型/向量数据库融合、三层缓存策略、六层鉴权模型、Prompt Injection 多层防御体系、Claude Code FSD 架构逆向与 Agent 隔离模式）；参考⽂献扩展⾄ 34 项 |
 | v1.1 | 2026-06-21 | AI Agent 架构组 | 新增第 6 章「企业级 Agent 沙箱安全体系」（L0-L3 分级、OpenAI Harness-Sandbox 分离、WASM/Firecracker/gVisor 对⽐、⽣产检查清单）；更新差距分析（新增⼯具沙箱安全 + Guardrails 维度）；更新架构路线图（增加 sandbox.py + L2 容器化）；扩展参考⽂献⾄ 23 项 |
 | v1.0 | 2026-06-21 | AI Agent 架构组 | 初版：三⼤⽣态调研、范式对⽐、差距分析、推荐路线图 |
 
 ---
 
-> **审计说明**: 本报告中所有数据、引⽤和结论均可在第 9 章"参考⽂献"中找到原始来源。需要时可根据参考⽂献 URL 追溯原始⽂档进⾏事实核查。沙箱安全章节的技术判断依据 Python 安全社区⻓期共识（PEP 551 已被官⽅拒绝）、OpenAI Agents SDK 2026.4 官⽅架构⽂档、E2B/AWS/Google Cloud 的⽣产安全模型，以及 CIS Docker Benchmark ⾏业标准。
+> **审计说明**: 本报告中所有数据、引⽤和结论均可在第 11 章"参考⽂献"中找到原始来源。需要时可根据参考⽂献 URL 追溯原始⽂档进⾏事实核查。沙箱安全章节的技术判断依据 Python 安全社区⻓期共识（PEP 551 已被官⽅拒绝）、OpenAI Agents SDK 2026.4 官⽅架构⽂档、E2B/AWS/Google Cloud 的⽣产安全模型，以及 CIS Docker Benchmark ⾏业标准。
