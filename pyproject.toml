@@ -1,0 +1,25 @@
+[project]
+name = "react-agent"
+version = "3.0.0"
+description = "Enterprise-grade ReAct Agent with local GGUF inference, full-chain observability, and YAML-driven protocol configuration"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [
+    {name = "Hello-Agents Chapter 4"}
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.8.0",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"

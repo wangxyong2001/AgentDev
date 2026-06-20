@@ -1,5 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+ReAct Agent — Enterprise Edition (v3.0).
+
+Refactored from monolithic script into modular architecture:
+  config.py          → 12-Factor app configuration (env vars + dataclass)
+  exceptions.py      → Exception hierarchy (RecoverableError vs FatalError)
+  logging_config.py  → Structured logging (replaces ts_print)
+  response_parser.py → Unified parser (eliminates dual-path rot)
+  config.py          → 12-Factor app configuration
+
+Architecture:
+  Factory
+  ├── ReActConfig.from_env()         → validated configuration
+  ├── setup_logging()                → structured logging
+  ├── ResponseParser(yaml_path)      → unified parser
+  └── run_react_agent(llm, ...)      → core loop (unchanged logic)
+"""
 
 import os
 import re
@@ -10,36 +27,40 @@ from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, field
 from datetime import datetime
 
-# 尝试导入 llama-cpp-python
+# ── Enterprise modules ──
+from llama.config import get_config, ReActConfig
+from llama.exceptions import (
+    ReActError, RecoverableError, FatalError,
+    ParseError, ToolNotFoundError, ToolExecutionError,
+    ConfigError, ModelLoadError, DependencyError,
+)
+from llama.logging_config import setup_logging, get_logger
+from llama.response_parser import ResponseParser
+
+# ── Structured logger (replaces ts_print) ──
+logger = get_logger(__name__)
+
+# ── Core dependencies with enterprise error handling ──
 try:
     from llama_cpp import Llama
 except ImportError:
-    print("[FATAL] llama-cpp-python not installed. Run: pip install llama-cpp-python")
-    sys.exit(1)
+    logger.fatal("llama-cpp-python not installed")
+    logger.hint("Run: pip install llama-cpp-python")
+    raise DependencyError("llama-cpp-python", "pip install llama-cpp-python")
 
-# 尝试导入 langchain tools
 try:
     from langchain.tools import tool
 except ImportError:
-    print("[FATAL] langchain not installed. Run: pip install langchain")
-    sys.exit(1)
-
-# ── 时间戳打印工具 ──
-import builtins
-
-
-def ts_print(*args, **kwargs):
-    """带毫秒时间戳的 print 包装函数。格式: [HH:MM:SS.mmm] 原内容"""
-    from datetime import datetime
-    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    builtins.print(f"[{ts}]", *args, **kwargs)
-
+    logger.fatal("langchain not installed")
+    logger.hint("Run: pip install langchain")
+    raise DependencyError("langchain", "pip install langchain")
 
 # 尝试导入 yaml
 try:
     import yaml
 except ImportError:
     yaml = None
+    logger.warn("pyyaml not installed — YAML protocol disabled, using built-in defaults")
 
 # ==========================================
 # 0. 协议加载器 — 从 YAML 模板加载交互格式
@@ -405,51 +426,53 @@ class ProtocolLoader:
 
 
 # ==========================================
-# 1. 配置区域 (请根据实际环境修改)
+# 1. 配置 — 12-Factor App (环境变量驱动)
 # ==========================================
-
-# 【重要】请修改为你的实际模型文件路径
-MODEL_PATH = "/home/nvidia/llama/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4_K_P.gguf"
-
-# ── NVIDIA GB10 (Grace Blackwell) 硬件优化参数 ──
-# 实际设备: DGX Spark / GB10-121G
-#   CPU: 20 核 ARM
-#   RAM: 121 GB 统一内存 (CPU/GPU 共享)
-#   GPU: GB10 (Blackwell 架构, Flash Attention 原生支持)
-#   模型: Qwen3.6-35B Q4_K_P (22 GB)
+# 所有配置项现在通过环境变量 REACT_* 控制，详见 llama/config.py
+# 覆盖默认值:  export REACT_MODEL_PATH=/path/to/model.gguf
+# 切换日志格式: export REACT_LOG_FORMAT=json
 #
-# 内存预算 (121 GB 总量):
-#   模型权重:       22 GB  (Q4_K_P 量化, 常驻)
-#   操作系统预留:     8 GB
-#   Python 运行时:    2 GB
-#   KV-Cache 32K:   ~8 GB  (35B × 2.5 层因子 × 32K × 2 bytes × 2(K+V) ≈ 8 GB)
-#   KV-Cache 64K:  ~16 GB  (线性增长)
-#   剩余空闲:      ~85 GB  (32K 时) / ~77 GB (64K 时)
-#   结论: 32K 上下文非常安全, 64K 也可尝试
-#
-# n_ctx:    上下文窗口上限。llama.cpp 按需分配 KV-Cache (增量式), 未用到的 token 不占内存。
-#           GB10 121GB 充裕: 128K 总占用 ≈ 64GB (53%) 完全可行。
-#           默认 32K — ReAct 8 轮约消耗 2~3K tokens, 32K 已有 10x 余量。
-# n_threads: CPU 线程数。GB10 有 20 核, 设为 10 (留 10 核给系统)。
-# n_batch:  批处理大小。121GB 内存充裕, 提升到 1024 增加吞吐。
+# 运行时获取配置:
+#   config = get_config()
+#   config.model_path, config.n_ctx, config.max_steps ...
 
-N_CTX = 32768
-N_GPU_LAYERS = -1      # -1 = 全部加载到 GPU (统一内存, 无拷贝开销)
-N_THREADS = 10          # 20 核 CPU, 留 10 核给系统进程
-N_BATCH = 1024
+config = get_config()
+if config is None:
+    logger.fatal("Configuration initialization failed.")
+    logger.hint("Check REACT_MODEL_PATH and other REACT_* environment variables.")
+    sys.exit(1)
 
-# ReAct 逻辑参数
-MAX_STEPS = 8  # 最大推理步数，防止死循环
-TEMPERATURE = 0.2  # 低温度保证格式稳定
-
-# Trace 输出路径
-TRACE_OUTPUT_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# Qwen 模型人民币定价 (¥/千tokens)
-QWEN_PRICE = {"input": 0.004, "output": 0.012}  # Qwen3.6 35B 国内定价
+# ── 兼容性别名 (企业模块中已迁移到 config 对象) ──
+MODEL_PATH = config.model_path
+N_CTX = config.n_ctx
+N_GPU_LAYERS = config.n_gpu_layers
+N_THREADS = config.n_threads
+N_BATCH = config.n_batch
+MAX_STEPS = config.max_steps
+TEMPERATURE = config.temperature
+TRACE_OUTPUT_DIR = config.trace_output_dir
+QWEN_PRICE = {"input": config.MODEL_PRICES["qwen3.6-35b"]["input"],
+              "output": config.MODEL_PRICES["qwen3.6-35b"]["output"]}
 
 # ==========================================
-# 1.5. Trace 追踪系统
+# 1.5. 统一 ResponseParser (消除双路径腐烂)
+# ==========================================
+# 单例 — 协议路径和回退路径共用同一个解析器
+_response_parser: Optional['ResponseParser'] = None
+
+def get_response_parser() -> ResponseParser:
+    """延迟初始化: 只在需要时加载 YAML 配置（避免阻塞启动）"""
+    global _response_parser
+    if _response_parser is None:
+        yaml_path = os.path.join(TRACE_OUTPUT_DIR, "ReActProtocol.yaml")
+        _response_parser = ResponseParser(yaml_path if os.path.exists(yaml_path) else None)
+        tool_names = [t.name for t in TOOLS]
+        # Validate parser works with registered tools
+        logger.init(f"ResponseParser initialized (YAML: {os.path.exists(yaml_path)}, tools: {tool_names})")
+    return _response_parser
+
+# ==========================================
+# 1.6. Trace 追踪系统
 # ==========================================
 
 @dataclass
@@ -890,11 +913,10 @@ class LlamaTracer:
         # Step 5: 终端即时输出 diff 摘要
         if diff and turn > 1:
             # 非首轮: 打印完整的差异摘要行
-            ts_print(f"[DIFF] {diff.summary_line}")
+            logger.diff(diff.summary_line)
         elif diff and turn == 1:
             # 首轮: 只打印 prompt 初始结构 (无上一轮可对比)
-            ts_print(f"[DIFF] initial prompt | system={decomp.system_len} chars | "
-                  f"user={decomp.user_len} chars | history={decomp.history_len} chars")
+            logger.diff(f"initial prompt | system={decomp.system_len}ch user={decomp.user_len}ch history={decomp.history_len}ch")
 
     def summary(self) -> Dict[str, Any]:
         """
@@ -969,7 +991,7 @@ class LlamaTracer:
         s = self.summary()
         cache_bar = self._bar(s['cache_hit_rate'], 30)
         reuse_bar = self._bar(s['avg_prompt_reuse_pct'], 30)
-        ts_print(f"""
+        logger.info(f"""
 ╔══════════════════════════════════════════════════════════╗
 ║              ReAct Trace Report                          ║
 ╠══════════════════════════════════════════════════════════╣
@@ -1147,33 +1169,33 @@ def init_llm():
       FileNotFoundError: 模型文件不存在
       SystemExit(1):     模型加载过程中发生任何错误 (CUDA OOM / 参数错误 / 内存不足)
     """
-    if not os.path.exists(MODEL_PATH):
-        raise FileNotFoundError(f"[FATAL] Model file not found: {MODEL_PATH}\nCheck the path and try again.")
+    if not os.path.exists(config.model_path):
+        raise ModelLoadError(f"Model file not found: {config.model_path}")
 
-    ts_print(f"[INIT] Loading model: {MODEL_PATH}")
-    ts_print(f"       context={N_CTX}  gpu_layers={N_GPU_LAYERS}  threads={N_THREADS}")
+    logger.init(f"Loading model: {config.model_path}")
+    logger.init(f"context={config.n_ctx}  gpu_layers={config.n_gpu_layers}  threads={config.n_threads}")
 
     try:
         llm = Llama(
-            model_path=MODEL_PATH,
-            n_ctx=N_CTX,                    # 上下文窗口 (字符数)
-            n_gpu_layers=N_GPU_LAYERS,      # GPU 层数: -1=全部, 0=纯CPU
-            n_threads=N_THREADS,             # CPU 线程数
-            n_batch=N_BATCH,                 # 批处理大小 (影响吞吐)
-            verbose=False,                          # 关闭 llama.cpp 详细日志, 避免污染输出
-            chat_format="qwen2",                    # Qwen 系列专用 chat_template
-            temp=TEMPERATURE,                       # 采样温度
-            top_p=0.95,                             # nucleus sampling 阈值
-            repeat_penalty=1.15,                    # 重复惩罚因子 (>1.0 = 抑制重复)
-            rope_scaling_type=1,                    # RoPE 缩放类型: 1=LINEAR (适应超长上下文)
-            flash_attn=True,                        # Flash Attention 加速 (Blackwell 架构原生支持)
+            model_path=config.model_path,
+            n_ctx=config.n_ctx,
+            n_gpu_layers=config.n_gpu_layers,
+            n_threads=config.n_threads,
+            n_batch=config.n_batch,
+            verbose=False,
+            chat_format=config.chat_format,
+            temp=config.temperature,
+            top_p=config.top_p,
+            repeat_penalty=config.repeat_penalty,
+            rope_scaling_type=config.rope_scaling_type,
+            flash_attn=config.flash_attn,
         )
-        ts_print("[INIT] Model loaded successfully.")
+        logger.init("Model loaded successfully.")
         return llm
     except Exception as e:
-        ts_print(f"[FATAL] Model load failed: {e}")
-        ts_print("[HINT] If CUDA OOM, try reducing N_CTX or set N_GPU_LAYERS=0 (CPU-only mode).")
-        sys.exit(1)
+        logger.fatal(f"Model load failed: {e}")
+        logger.hint("If CUDA OOM, try reducing REACT_N_CTX or set REACT_N_GPU_LAYERS=0 (CPU-only mode).")
+        raise ModelLoadError(str(e)) from e
 
 # ==========================================
 # 4. ReAct 核心逻辑
@@ -1386,11 +1408,11 @@ def run_react_agent(llm: Llama, question: str, max_steps: int = MAX_STEPS,
     history = []
     current_input = question
 
-    ts_print(_fmt("agent_start") or f"\n[AGENT] === ReAct loop start ===")
-    ts_print(_fmt("agent_question", question=question) or f"[AGENT] Question: {question}\n")
+    logger.agent(_fmt("agent_start") or "ReAct loop start")
+    logger.agent(_fmt("agent_question", question=question) or f"Question: {question}")
 
     for step in range(1, max_steps + 1):
-        ts_print(_fmt("step_header", step=step) or f"[STEP {step}] --------------------------------------------------")
+        logger.step(_fmt("step_header", step=step) or f"--- Step {step} ---")
         t_start = time.time()
 
         # ═══ Step 1: 构建 Prompt 并调用 LLM ═══
@@ -1412,17 +1434,15 @@ def run_react_agent(llm: Llama, question: str, max_steps: int = MAX_STEPS,
         prompt_tokens = usage.get("prompt_tokens", len(prompt) // 4)
         completion_tokens = usage.get("completion_tokens", len(raw_output) // 4)
 
-        ts_print(_fmt("llm_raw", raw_output=raw_output[:200]) or f"[LLM] Raw: {raw_output[:200]}")
-        ts_print(_fmt("llm_tokens", prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens, duration_ms=f"{duration_ms:.0f}")
-              or f"[LLM] tokens: prompt={prompt_tokens}  completion={completion_tokens}  duration={duration_ms:.0f}ms")
+        logger.debug(_fmt("llm_raw", raw_output=raw_output[:200]) or f"Raw: {raw_output[:200]}")
+        logger.llm(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, duration_ms=duration_ms)
 
         # ═══ Step 2: 解析 LLM 输出 ═══
         parse_error = None
         try:
             parsed = _parse(llm_output)
         except ValueError as e:
-            ts_print(_fmt("error_parse", error=str(e)) or f"[ERROR] Parse failed: {e}")
+            logger.error(f"Parse failed: {e}")
             parse_error = str(e)
             # ── Error Recovery: 将解析失败的输出作为 Observation 反馈给模型, 让它重试 ──
             if tracer:
@@ -1447,14 +1467,14 @@ def run_react_agent(llm: Llama, question: str, max_steps: int = MAX_STEPS,
         action = parsed["action"]
         action_input = parsed["action_input"]
 
-        ts_print(_fmt("trace_thought", thought=thought) or f"[TRACE] Thought: {thought}")
-        ts_print(_fmt("trace_action", action=action) or f"[TRACE] Action: {action}")
-        ts_print(_fmt("trace_input", action_input=action_input) or f"[TRACE] Input: {action_input}")
+        logger.trace(_fmt("trace_thought", thought=thought) or f"Thought: {thought}")
+        logger.trace(_fmt("trace_action", action=action) or f"Action: {action}")
+        logger.trace(_fmt("trace_input", action_input=action_input) or f"Input: {action_input}")
 
         # ═══ Step 3: 执行 Action (工具调用 或 返回最终答案) ═══
         if action == "final_answer":
             final_answer = action_input
-            ts_print(_fmt("result_final", answer=action_input) or f"\n[RESULT] Final Answer: {final_answer}\n")
+            logger.result(_fmt("result_final", answer=action_input) or f"Final Answer: {action_input}")
             if tracer:
                 tracer.record_turn(
                     turn=step, question=question, prompt=prompt,
@@ -1480,7 +1500,7 @@ def run_react_agent(llm: Llama, question: str, max_steps: int = MAX_STEPS,
                 observation = f"Tool execution error: {str(e)}"
                 tool_error = True
 
-        ts_print(_fmt("trace_obs", observation=observation) or f"[TRACE] Observation: {observation}\n")
+        logger.trace(_fmt("trace_obs", observation=observation) or f"Observation: {observation}")
 
         # ── Trace: 将本轮完整数据记录到追踪器 ──
         if tracer:
@@ -1510,7 +1530,7 @@ def run_react_agent(llm: Llama, question: str, max_steps: int = MAX_STEPS,
         # ═══ Step 5: 准备下一轮输入 (注入新 Observation) ═══
         current_input = f"Based on the observation, what should I do next?\nObservation: {observation}"
 
-    ts_print(_fmt("warn_max_steps", max_steps=max_steps) or f"[WARN] Max steps ({max_steps}) reached. Loop terminated.")
+    logger.warn(f"Max steps ({max_steps}) reached. Loop terminated.")
     return "Agent stopped due to max steps."
 
 # ==========================================
@@ -1518,22 +1538,30 @@ def run_react_agent(llm: Llama, question: str, max_steps: int = MAX_STEPS,
 # ==========================================
 
 if __name__ == "__main__":
-    # ── Step 1: 初始化本地 LLM 实例 (加载 GGUF 模型) ──
+    # ── Enterprise bootstrap: logging → config → parser ──
+    logger.init(f"ReAct Agent v3.0 — Enterprise Edition")
+    logger.init(f"Config: model={os.path.basename(config.model_path)}  ctx={config.n_ctx}  "
+                f"format={config.chat_format}  log={config.log_level}/{config.log_format}")
+
+    # ── Step 1: 初始化本地 LLM 实例 ──
     try:
         llm = init_llm()
-    except Exception as e:
-        ts_print(f"[FATAL] Initialization failed: {e}")
+    except (FatalError, ModelLoadError) as e:
+        logger.fatal(f"Initialization failed: {e}")
         sys.exit(1)
 
     # ── Step 2: 初始化全量数据追踪器 ──
     tracer = LlamaTracer()
 
-    # ── Step 3: 加载 ReAct 协议模板 (YAML 驱动交互格式, 可选) ──
+    # ── Step 3: 加载 ReAct 协议模板 ──
     proto_path = os.path.join(TRACE_OUTPUT_DIR, "ReActProtocol.yaml")
     protocol = ProtocolLoader(proto_path) if os.path.exists(proto_path) else None
-    ts_print(f"[TRACE] Session started. Model: {tracer.model_name}  Protocol: {'YAML' if protocol else 'built-in'}")
+    parser = get_response_parser()  # Unified parser (enterprise)
+    logger.trace(f"Session started. Model: {tracer.model_name}  "
+                 f"Protocol: {'YAML' if protocol else 'built-in'}  "
+                 f"Parser: unified")
 
-    # ── Step 4: 定义测试问题列表 ──
+    # ── Step 4: 测试问题 ──
     test_questions = [
         "What is 123 multiplied by 45?",
         "What is the weather in London multiplied by 2?",
@@ -1542,12 +1570,12 @@ if __name__ == "__main__":
 
     for q in test_questions:
         result = run_react_agent(llm, q, tracer=tracer, protocol=protocol)
-        ts_print(protocol.fmt("result_line", result=result) if protocol else f"[RESULT] {result}")
-        ts_print("-" * 50)
+        logger.result(str(result))
 
     # 打印追踪摘要
     tracer.print_summary()
 
-    # ── Step 6: 导出自包含 HTML 可视化报告 ──
+    # ── Step 5: 导出 HTML Trace 报告 ──
     html_path = os.path.join(TRACE_OUTPUT_DIR, "ReActTrace.html")
     tracer.export_html(html_path)
+    logger.info(f"HTML report saved: {html_path}")

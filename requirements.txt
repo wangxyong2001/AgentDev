@@ -1,0 +1,25 @@
+# ==========================================================================
+# ReAct Agent — Enterprise Production Dependencies
+# ==========================================================================
+# Install: pip install -r requirements.txt
+#
+# Tier 1: Core (required — GGUF local inference)
+llama-cpp-python>=0.3.30          # LLM inference engine (GGUF)
+langchain>=0.3.0                  # @tool decorator
+
+# Tier 2: Protocol (recommended — YAML-driven format configuration)
+pyyaml>=6.0                       # YAML protocol loader
+
+# Tier 3: Observability (recommended — structured logging)
+# opentelemetry-api>=1.28.0       # Uncomment for distributed tracing
+# opentelemetry-sdk>=1.28.0
+# prometheus-client>=0.20.0       # Uncomment for metrics
+
+# Tier 4: API (optional — REST API deployment)
+# fastapi>=0.115.0                # Uncomment for HTTP API
+# uvicorn[standard]>=0.32.0
+# pydantic>=2.10.0
+
+# Tier 5: Persistence (optional — session storage)
+# redis>=5.0.0                    # Uncomment for session cache
+# sqlalchemy>=2.0.0               # Uncomment for RDBMS
