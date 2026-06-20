@@ -1,8 +1,8 @@
 # AI Agent 开发行业最佳实践调研报告
 
-> 文档版本: v1.3 | 调研日期: 2026-06-21 | 作者: AI Agent 架构组
+> 文档版本: v1.4 | 调研日期: 2026-06-21 | 作者: AI Agent 架构组
 > 机密级别: 内部
-> 调研范围: LangChain 1.0、OpenAI Agents SDK、Anthropic Claude Agent 三⼤⽣态 + 沙箱安全 + 基础设施 + 边界划定方法论
+> 调研范围: LangChain 1.0、OpenAI Agents SDK、Anthropic Claude Agent 三⼤⽣态 + 沙箱安全 + 基础设施 + 边界划定 + 四⼤⼯程学科 (Prompt/Context/Harness/Loop)
 
 ---
 
@@ -1027,7 +1027,295 @@ START: 我有一个任务需要 AI Agent 完成
 
 ---
 
-## 10. 架构演进路线图
+## 10. 四⼤⼯程学科 — Prompt / Context / Harness / Loop Engineering
+
+> ⚠️ **核⼼观点**: 模型提供推理能⼒，但**⼯程层决定了 Agent 能否⽣产就绪**。2025-2026 年⾏业共识：**Agent = Model + Harness**。四⼤学科（Prompt → Context → Harness → Loop）构成了从「模型能回答」到「Agent 能⾏动」的完整⼯程栈。
+
+### 10.1 Prompt Engineering — 系统提示词⼯程化
+
+#### 10.1.1 ⽣产级 Prompt 的⼗段结构
+
+Reltio AgentFlow (2025-2026) 定义的⽣产级系统提示词结构：
+
+| # | 段落 | 职责 |
+|---|------|------|
+| 1 | **Identity** | Agent 是谁，做什么，**不**做什么 |
+| 2 | **Objectives** | 具体、可测量的⽬标 |
+| 3 | **First-turn behavior** | ⾸轮交互⾏为（明确请求 vs 模糊请求） |
+| 4 | **Tone & Style** | 输出⻛格（Markdown、简洁性） |
+| 5 | **Tools** | 可⽤⼯具及**选择条件**（When to use） |
+| 6 | **Workflow** | 编号执⾏步骤（触发→⾏动→输出→下⼀步） |
+| 7 | **Guardrails** | 确认矩阵、操作限制、禁⽌⾏为 |
+| 8 | **Output Format** | 输出结构要求（JSON Schema 优先） |
+| 9 | **Error Handling** | ⽤⼾输⼊/权限/服务/⼯具故障处理 |
+| 10 | **Internal Logic** | 隐藏决策算法（可选） |
+
+#### 10.1.2 ⾏业共识的五条⾦规则
+
+| 规则 | 说明 |
+|------|------|
+| **指令放在第 1 ⾏** | 推理模型先规划后扫描上下⽂，指令埋在第 2,400 ⾏= 50%概率被忽略（FutureAGI 2026） |
+| **XML 标签优于 ASCII 分隔线** | Anthropic 官⽅：`<persona>` `<safety_rules>` 作⽤为注意⼒锚点 |
+| **⼯具描述放 Schema，不放 Prompt** | LangGraph 通过 `@tool` 装饰器传递 Schema，Prompt 内重复=浪费 Token（Blackmon Lab） |
+| **正向指令优于负向** | "返回 A/B/C 之⼀" > "不要返回其他内容"。arXiv 2604.11088 实验验证 |
+| **约束固定在 Prompt 顶部** | "Lost in the middle" 效应持续⾄ 2026，安全规则必须在头部重申 |
+
+#### 10.1.3 2025-2026 范式转变
+
+| 旧实践 | 新实践 |
+|--------|--------|
+| 上下⽂先, 指令后 | **指令第 1 ⾏**, 上下⽂后 |
+| ASCII 分隔 | **语义 XML 标签** (`<persona>`, `<workflows>`) |
+| "Think step by step" ⽆差别使⽤ | **推理模型去除此类指令**（更慢、⽆精度提升） |
+| 10+ few-shot | **2-4 示例**分类, 0-1 ⽣成 |
+| 硬编码值 | **运⾏时动态加载** |
+| Prompt 作为单⼀字符串 | **分层 Prompt 栈**: 静态前缀 + Schema + 动态后缀 + 约束 |
+
+#### 10.1.4 Claude Code Prompt 构建体系（源码逆向）
+
+Claude Code 的 `buildEffectiveSystemPrompt()` (源码: `utils/systemPrompt.ts`):
+
+```
+优先级栈 (⾼→低):
+  0. overrideSystemPrompt         ← 紧急覆盖（Loop Mode / 安全更新）
+  1. Coordinator System Prompt    ← 多 Agent 协调者模式
+  2. Agent System Prompt          ← 主/⼦ Agent 模式
+     ├── Proactive: Agent prompt 追加到默认后
+     └── Normal:   Agent prompt 替换默认
+  3. Custom System Prompt         ← --system-prompt CLI 参数
+  4. Default System Prompt        ← 标准 Claude Code prompt
+     ├── Intro (身份) → System (规则) → Tasks (任务指南)
+     ├── Actions (可逆性) → Tools (⼯具使⽤) → Tone (⻛格)
+     └── OutputEfficiency (输出效率) → SessionGuidance (会话指南)
+  +  appendSystemPrompt           ← 始终追加（除 override 外）
+```
+
+动态分段加载：每个 Agent Mode 加载不同的段组合。静态前缀(~12,290 tokens) 缓存命中的成本降低 90%。
+
+**数据来源**: [Reltio AgentFlow Guidelines](https://docs.reltio.com/en/products/agentflow/), [FutureAGI: LLM Prompt Format 2026](https://futureagi.com/blog/llm-prompts-best-practices-2025/), [Claude Code systemPrompt.ts](file:///home/nvidia/workspace/ClaudeCode/extracted-src/src/utils/systemPrompt.ts), [arXiv 2604.11088](https://arxiv.org/html/2604.11088v2)
+
+---
+
+### 10.2 Context Engineering — 上下⽂窗⼝⼯程化
+
+#### 10.2.1 核⼼问题
+
+> "普通 LLM API 调⽤浪费 40-60% 输⼊ Token 在模型不需要的上下⽂上" — Morph (Mar 2026)
+> "65% 的企业 AI 故障来⾃上下⽂退化，⽽⾮ Token 耗尽" — Mem0 (2026)
+
+#### 10.2.2 上下⽂压缩的三层策略
+
+| 层 | 技术 | 压缩率 | 质量影响 |
+|----|------|--------|---------|
+| **KV-Cache 压缩** | TurboQuant (3-bit KV, 2026) / UltraQuant (4-bit) | 3-6x 内存 | 零精度损失（旋转+码书量化） |
+| **上下⽂压缩** | Morph Compact / LCLM (encoder-decoder) | 2-16x (1:4→1:16) | 轻微（⾼压缩率需⾃适应展开） |
+| **虚拟上下⽂** | Virtual Context (虚拟内存模型) | 100x (937K→65K) | 95% 准确率 vs 33% 基线 |
+| **语义缓存** | LangCache / Redis Vector | N/A (避免调⽤) | 68.8% 成本节省 |
+
+#### 10.2.3 Token Budget 管理
+
+开源项⽬ SynthOrg (#416) 的⽣产模式：
+
+```
+软预算指⽰器: [Context: 12,450/16,000 tokens | 3 archived blocks]
+硬限制: max_tokens + reserve_for_output
+策略: trim_oldest / trim_middle / summarize / compress
+触发: 任务边界 + 预算阈值（80% 警告, 95% 强制压缩）
+```
+
+**基线数据**:
+- RAG Agent 100K ⽇查询: $7,250/天 → **$1,800/天** (75% 降低, Zenodo 2026)
+- Hive (NVIDIA 边缘): $15,000/⽉ → **$5,250/⽉** (64% Token 减少)
+- ⼯具输出: 5000⾏测试⽇志 → 30 Token (**803x 压缩**)
+
+#### 10.2.4 「重复压缩」问题（Baseten Research, Mar 2026）
+
+> 每⼀轮有损压缩引⼊的误差，成为下⼀轮的信号——类似「JPEG 的 JPEG」。分块压缩（per-document）显著优于整体压缩。
+
+**解决⽅案**: 分块压缩 + 关键段标记（不压缩硬约束、数值、跨任务依赖）。
+
+#### 10.2.5 Claude Code 上下⽂管理（源码分析）
+
+| 组件 | 源码位置 | 功能 |
+|------|---------|------|
+| `context.ts` (189⾏) | `src/context.ts` | 上下⽂窗⼝状态管理 |
+| `tokenBudget.ts` (93⾏) | `src/query/tokenBudget.ts` | Token 预算计算与检查 |
+| `autoCompact` | `src/query.ts` (1729⾏) | ⾃动上下⽂压缩触发 |
+| `reactiveCompact` | `src/query.ts` | 响应式压缩策略 |
+
+Claude Code 使⽤ `compact-2026-01-12` API (Beta header) 做服务端单参数压缩。丢失项⽬: 精确数值、硬约束、决策推理、跨任务依赖、隐式偏好（Mem0 对⽐分析）。
+
+**数据来源**: [Morph: LLM Inference Optimization](https://www.morphllm.com/llm-inference-optimization), [Baseten: Repeated KV Cache](https://www.baseten.co/research/repeated-kv-cache-for-long-running-agents/), [Zenodo: Caching & Context Management](https://zenodo.org/records/19076627), [Mem0: Hermes vs Claude Code](https://mem0.ai/blog/how-hermes-and-claude-handle-context-compression)
+
+---
+
+### 10.3 Harness Engineering — 运⾏时控制平⾯
+
+#### 10.3.1 核⼼定义
+
+> "模型回答；Agent ⾏动。Agent Harness 是把前者变成后者的运⾏时。" — Best-of-Agent-Harnesses (2026)
+
+> "Harness 质量决定可部署性，胜过模型质量。" — CAAF Framework (arXiv, Apr 2026)
+
+#### 10.3.2 11 组件职责模型（arXiv 2605.13357, May 2026）
+
+学术界 2026 年 5 ⽉正式定义了 Agent Harness 的 11 个组件责任：
+
+| # | 组件 | 职责 |
+|---|------|------|
+| 1 | **Task Specification** | 任务定义与分解 |
+| 2 | **Context Selection** | 上下⽂选择与裁剪 |
+| 3 | **Tool Access** | ⼯具注册、路由、权限 |
+| 4 | **Project Memory** | 项⽬级知识库 (CLAUDE.md / AGENTS.md) |
+| 5 | **Task State** | 任务状态机与检查点 |
+| 6 | **Observability** | 执⾏追踪与指标 |
+| 7 | **Failure Attribution** | 失败归因与分类 |
+| 8 | **Verification** | 输出验证 |
+| 9 | **Permissions** | 权限执⾏ |
+| 10 | **Entropy Auditing** | 熵审计（检测模型输出随机性异常） |
+| 11 | **Intervention Recording** | ⼲预记录（⼈⼯接管追踪） |
+
+#### 10.3.3 H0-H3 成熟度阶梯
+
+| 级别 | 能⼒ | 代表项⽬ |
+|------|------|---------|
+| **H0: 脚本级** | 硬编码 Agent 循环，⽆状态管理 | 教学 Demo |
+| **H1: 框架级** | 抽象 Runner + 基础状态 | LangChain AgentExecutor |
+| **H2: 平台级** | 容器化执⾏ + 持久状态 + 审批流 | LangGraph + PostgresSaver |
+| **H3: ⽣态级** | 多 Agent 协调 + eBPF 策略执⾏ + ⾃愈 | ActPlane + Coordinators |
+
+**本项⽬定位**: H1（已有 Runner 抽象 + 基础状态），向 H2 演进中。
+
+#### 10.3.4 策略执⾏的三层模型
+
+| 层 | ⽅式 | 局限 |
+|----|------|------|
+| **Prompt 约束** (CLAUDE.md) | 概率性 | ⻓上下⽂ Agent 遗忘或绕过 |
+| **⼯具层拦截** (MCP Gateway) | API 级 | Agent Shell ⼦进程绕过 |
+| **OS 级强制** (ActPlane eBPF) | 确定性内核级 | 覆盖所有进程、⽂件、⽹络操作 |
+
+ActPlane DSL 示例: `"no git push"`, `"run tests before committing"` → `notify/block/kill`。2025-2026 年新⽅向: 从概率性约束⾛向确定性执⾏。
+
+#### 10.3.5 Claude Code Harness 实现（源码分析）
+
+| Harness 组件 | Claude Code 实现 | 源码位置 |
+|-------------|-----------------|---------|
+| **QueryEngine** | ⽣命周期管理、消息编排、成本追踪 | `src/QueryEngine.ts` (1295⾏) |
+| **query.ts** | 执⾏循环、上下⽂压缩、流式处理 | `src/query.ts` (1729⾏) |
+| **状态管理** | AppStateStore | `src/state/AppStateStore.ts` |
+| **⼯具权限** | 24 ⽂件权限体系 | `src/utils/permissions/` |
+| **成本追踪** | cost-tracker.ts + costHook.ts | `src/cost-tracker.ts` |
+| **会话持久化** | Session / History management | `src/history.ts` |
+| **多 Agent** | Coordinator + Buddy/Teammate | `src/coordinator/` + `src/buddy/` |
+
+**数据来源**: [AI Harness Engineering (arXiv 2605.13357)](https://browse-export.arxiv.org/abs/2605.13357), [CAAF Framework (arXiv 2604.17025)](https://browse-export.arxiv.org/abs/2604.17025), [TechTarget: Harness Engineering](https://www.techtarget.com/searchapparchitecture/tip/Harness-engineering-Agent-harnesses-as-critical-infrastructure), [Best-of-Agent-Harnesses](https://github.com/RyanAlberts/best-of-Agent-Harnesses), [Faros: Harness Engineering](https://www.faros.ai/blog/harness-engineering)
+
+---
+
+### 10.4 Loop Engineering — 执⾏循环与终⽌条件
+
+#### 10.4.1 真实⽣产事故
+
+| 事故 | 时间 | 损失 | 根因 |
+|------|------|------|------|
+| Claude Code 递归循环 | Jul 2025 | **$16K-$50K** | ⽆ maxTurns 限制 |
+| LangChain 4-Agent 流程 | Nov 2025 | **$47K** (11天) | 测试通过但缺终⽌边界 |
+| nanoclaw 重复消息 | Feb 2026 | 21条/32秒 | `query()` ⽆ `maxTurns` |
+
+> "整个问题在三⾏代码中: while True: result = agent.run(task); # done when...?" — freeCodeCamp (Dec 2025)
+
+#### 10.4.2 ⽣产级状态机模式
+
+```
+IDLE → OBSERVE → PLAN → ACT → VERIFY → DONE
+                      ↑        ↓
+                    REFINE ← FAILED
+```
+
+显式状态转换 (Transition Map):
+
+| 当前状态 | 合法后续状态 |
+|---------|------------|
+| IDLE | OBSERVE |
+| OBSERVE | PLAN, DONE |
+| PLAN | ACT, FAILED |
+| ACT | VERIFY, FAILED |
+| VERIFY | DONE, REFINE |
+| REFINE | PLAN, FAILED |
+
+**Claude Code 执⾏循环** (源码: `query.ts` 1729⾏):
+
+```
+for await (const message of queryLoop()) {
+  switch (message.type) {
+    case 'user':        // 处理⽤⼾消息 → 加载技能/插件
+    case 'assistant':   // 处理 AI 响应 → 提取⼯具调⽤
+    case 'tool_use':    // 执⾏⼯具 → 返回结果
+    case 'progress':    // 进度更新 → 流式输出
+  }
+}
+```
+
+#### 10.4.3 熔断器 + 账本模式（⽣产五件套）
+
+| 组件 | 职责 |
+|------|------|
+| **Spec Writer** | 循环开始前强制定义 "done" |
+| **Circuit Breaker** | turn_count + token_count 双硬限制，**调⽤前检查**（事后检查太迟） |
+| **Ledger** | SQLite append-only 审计账本（每轮⼀⾏，SHA-256 哈希输⼊，不含 PII） |
+| **Agent Loop** | 连接 Spec + Breaker + Ledger |
+| **Review Surface** | 下游消费前的⼈⼯确认⾯板 |
+
+**熔断规则**:
+- 调⽤ **前** 检查（post-flight 太晚，Token 已消耗）
+- 双天花: `turn_limit` + `token_limit`
+- `turn_count == turn_limit + 1` → ⽴即熔断（⽆宽限期）
+- 熔断时打印可读检查点，抛出 `CircuitBreakerError`
+
+#### 10.4.4 终⽌条件矩阵
+
+| 机制 | 典型默认值 | 适⽤场景 |
+|------|-----------|---------|
+| `maxTurns` | 10-100 | 所有 Agent（强制的安全带）|
+| Token Budget | 总 Token 消耗上限 | 成本敏感场景 |
+| Wall-clock Timeout | 300s (会话) | 交互式应⽤ |
+| `stop_reason == "end_turn"` | 模型信号 | 正常完成 |
+| Verification Failure | N 次验证失败 | 质量闸⻔ |
+| Cancellation (AbortSignal) | 外部信号 | ⽤⼾取消 / 系统停机 |
+
+**渐进式重试**: 每次重试增加 `maxTurns` (+10)，注⼊失败上下⽂（跳过⽂件重读，直接执⾏）。
+
+#### 10.4.5 ⽣产监控指标
+
+Gartner 预测 40% Agentic 项⽬将在 2027 年前因经济原因被废弃（多数可通过正确终⽌条件避免）。
+
+| 指标 | ⽤途 |
+|------|------|
+| `maxIterationBreachRate` | 命中上限但未完成的 Traces% |
+| `TrajectoryScore` | 评分序列⽽⾮仅最终答案 |
+| `ToolSelectionAccuracy` | 正确⼯具选择率 |
+| `p99 latency by graph node` | 每步延迟分布 |
+| `Token-cost-per-trace` | 每条 Trace 成本 |
+| `Human-escalation rate` | ⼈⼯接⼊率 |
+
+#### 10.4.6 本项⽬ Loop 对⽐
+
+| 能⼒ | Claude Code | 本项⽬ ReActDemo | AgentCore (Phase 2) |
+|------|------------|-----------------|-------------------|
+| 执⾏循环 | `queryLoop()` (1729⾏) | `run_react_agent()` (170⾏) | `AgentCore.run()` (130⾏) |
+| maxTurns | ✅ 内置 | ✅ MAX_STEPS=8 | ✅ max_steps 可配置 |
+| Token Budget | ✅ tokenBudget.ts | ❌ | ⏳ Phase 3 |
+| 状态机 | 显式 message.type switch | 隐式 for-loop | ✅ 8 状态转换 |
+| 熔断器 | ✅ 多次调⽤前检查 | ❌ 仅步数限制 | ⏳ Phase 3 |
+| 审计账本 | ✅ History + Transcript | 🟡 LlamaTracer (内存) | ⏳ Phase 3 SQLite |
+| 压缩 | ✅ autoCompact + reactiveCompact | ❌ | ⏳ Phase 3 |
+| 流式 | ✅ AsyncGenerator | ❌ 同步 | ⏳ Phase 3 |
+
+**数据来源**: [freeCodeCamp: Production-Safe Agent Loop](https://www.freecodecamp.org/news/how-to-build-a-production-safe-agent-loop-from-exit-conditions-to-audit-trails/), [Claude Code query.ts](file:///home/nvidia/workspace/ClaudeCode/extracted-src/src/query.ts), [LangGraph Guide (FutureAGI)](https://futureagi.com/glossary/langgraph/)
+
+---
+
+## 11. 架构演进路线图
 
 ```
 当前 (v2.1): 单体 ReActDemo + 5 个企业模块
@@ -1055,7 +1343,7 @@ Phase 3 (v3.0): ── 7 ⽉底 (⽣产就绪)
 
 ---
 
-## 11. 参考⽂献
+## 12. 参考⽂献
 
 | 序号 | 来源 | 类型 | URL |
 |------|------|------|-----|
@@ -1098,10 +1386,11 @@ Phase 3 (v3.0): ── 7 ⽉底 (⽣产就绪)
 
 ---
 
-## 12. 版本历史
+## 13. 版本历史
 
 | 版本 | ⽇期 | 作者 | 变更说明 |
 |------|------|------|---------|
+| v1.4 | 2026-06-21 | AI Agent 架构组 | 新增第 10 章「四⼤⼯程学科」—— Prompt Engineering（⼗段结构、五条⾦规则、范式转变、Claude Code 优先级栈）、Context Engineering（KV-Cache 压缩、虚拟上下⽂、Token Budget、重复压缩问题）、Harness Engineering（11 组件模型、H0-H3 阶梯、三层策略执⾏、Claude Code 源码映射）、Loop Engineering（⽣产事故案例、状态机、Circuit Breaker+Ledger、终⽌条件矩阵、本项⽬对⽐）；参考⽂献扩展⾄ 40+ 项 |
 | v1.3 | 2026-06-21 | AI Agent 架构组 | 新增第 9 章「Agent 边界划定方法论」（六个思考维度：责任/信任/上下文/工具/生命周期/协作 + 决策树框架 + 行业反模式警示）；报告扩展至 12 章 |
 | v1.2 | 2026-06-21 | AI Agent 架构组 | 新增第 8 章「企业级 Agent 基础设施体系」（RAG 知识库关系型/向量数据库融合、三层缓存策略、六层鉴权模型、Prompt Injection 多层防御体系、Claude Code FSD 架构逆向与 Agent 隔离模式）；参考⽂献扩展⾄ 34 项 |
 | v1.1 | 2026-06-21 | AI Agent 架构组 | 新增第 6 章「企业级 Agent 沙箱安全体系」（L0-L3 分级、OpenAI Harness-Sandbox 分离、WASM/Firecracker/gVisor 对⽐、⽣产检查清单）；更新差距分析（新增⼯具沙箱安全 + Guardrails 维度）；更新架构路线图（增加 sandbox.py + L2 容器化）；扩展参考⽂献⾄ 23 项 |
@@ -1109,4 +1398,4 @@ Phase 3 (v3.0): ── 7 ⽉底 (⽣产就绪)
 
 ---
 
-> **审计说明**: 本报告中所有数据、引⽤和结论均可在第 11 章"参考⽂献"中找到原始来源。需要时可根据参考⽂献 URL 追溯原始⽂档进⾏事实核查。沙箱安全章节的技术判断依据 Python 安全社区⻓期共识（PEP 551 已被官⽅拒绝）、OpenAI Agents SDK 2026.4 官⽅架构⽂档、E2B/AWS/Google Cloud 的⽣产安全模型，以及 CIS Docker Benchmark ⾏业标准。
+> **审计说明**: 本报告中所有数据、引⽤和结论均可在第 12 章"参考⽂献"中找到原始来源。需要时可根据参考⽂献 URL 追溯原始⽂档进⾏事实核查。沙箱安全章节的技术判断依据 Python 安全社区⻓期共识（PEP 551 已被官⽅拒绝）、OpenAI Agents SDK 2026.4 官⽅架构⽂档、E2B/AWS/Google Cloud 的⽣产安全模型，以及 CIS Docker Benchmark ⾏业标准。
