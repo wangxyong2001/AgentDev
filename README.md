@@ -1,4 +1,4 @@
-# ReAct Agent — Enterprise-Grade Local Inference System
+# Enterprise-Grade Agent Practice
 
 > **Agent = Model + Harness** — 基于行业调研的工程化实践
 
